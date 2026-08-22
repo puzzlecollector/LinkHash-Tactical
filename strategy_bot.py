@@ -430,15 +430,12 @@ def execute(con, sig):
             size = round(BET_USDC / max(entry, 0.01), 2)
             if size * entry < 1.0:      # Polymarket min order ~ $1
                 size = round(1.0 / entry, 2)
-            from py_clob_client_v2 import OrderArgs, OrderType
-            try:
-                from py_clob_client_v2 import CreateOrderOptions as _OPT
-            except Exception:
-                from py_clob_client_v2 import PartialCreateOrderOptions as _OPT
+            from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions as _OPT
             try:
                 from py_clob_client_v2 import Side as _Side; _buy = _Side.BUY
             except Exception:
                 from py_clob_client_v2.order_builder.constants import BUY as _buy
+            # PartialCreateOrderOptions: neg_risk left None -> client auto-detects it.
             resp = clob().create_and_post_order(               # marketable FAK at cap
                 order_args=OrderArgs(token_id=sig["token_id"], price=sig["cap"],
                                      size=size, side=_buy),
