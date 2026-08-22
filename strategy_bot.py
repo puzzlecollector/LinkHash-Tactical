@@ -17,7 +17,8 @@ latency, fair):
                         strike = the buffered price at the window's open epoch.
   * Market discovery  : Polymarket Gamma API (/events?tag_slug=crypto).
   * Order book        : public Polymarket CLOB (/book) — the real ask we'd pay.
-  * Order placement   : Polymarket CLOB (py-clob-client, signed).
+  * Order placement   : Polymarket CLOB V2 (py-clob-client-v2, POLY_1271 deposit
+                        wallet: signature_type=3 + funder). FAK marketable orders.
   * Settlement (P&L)  : LinkHash Data API /settlements — post-hoc accounting only
                         (observation, not a live-edge input).
 
@@ -328,14 +329,28 @@ _clob = None
 
 
 def clob():
+    """Polymarket V2 CLOB client (py-clob-client-v2) — supports the deposit-wallet
+    POLY_1271 flow (signature_type=3 + funder). Only used to PLACE orders."""
     global _clob
     if _clob is None:
-        from py_clob_client.client import ClobClient
-        c = ClobClient(host=PM_HOST, key=PM_KEY, chain_id=PM_CHAIN,
+        from py_clob_client_v2 import ClobClient
+        c = ClobClient(host=PM_HOST, chain_id=PM_CHAIN, key=PM_KEY,
                        signature_type=PM_SIG_TYPE, funder=PM_FUNDER or None)
-        c.set_api_creds(c.create_or_derive_api_creds())
+        c.set_api_creds(c.create_or_derive_api_key())
         _clob = c
     return _clob
+
+
+_tick_cache = {}
+
+
+def tick_size(token_id):
+    if token_id not in _tick_cache:
+        try:
+            _tick_cache[token_id] = str(clob().get_tick_size(token_id))
+        except Exception:
+            _tick_cache[token_id] = "0.01"
+    return _tick_cache[token_id]
 
 
 # ---- signal scan ------------------------------------------------------------
@@ -415,11 +430,20 @@ def execute(con, sig):
             size = round(BET_USDC / max(entry, 0.01), 2)
             if size * entry < 1.0:      # Polymarket min order ~ $1
                 size = round(1.0 / entry, 2)
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import BUY
-            order = clob().create_order(OrderArgs(
-                token_id=sig["token_id"], price=sig["cap"], size=size, side=BUY))
-            resp = clob().post_order(order, OrderType.FAK)   # marketable, no resting
+            from py_clob_client_v2 import OrderArgs, OrderType
+            try:
+                from py_clob_client_v2 import CreateOrderOptions as _OPT
+            except Exception:
+                from py_clob_client_v2 import PartialCreateOrderOptions as _OPT
+            try:
+                from py_clob_client_v2 import Side as _Side; _buy = _Side.BUY
+            except Exception:
+                from py_clob_client_v2.order_builder.constants import BUY as _buy
+            resp = clob().create_and_post_order(               # marketable FAK at cap
+                order_args=OrderArgs(token_id=sig["token_id"], price=sig["cap"],
+                                     size=size, side=_buy),
+                options=_OPT(tick_size=tick_size(sig["token_id"])),
+                order_type=OrderType.FAK)
             order_id = (resp or {}).get("orderID") or (resp or {}).get("orderId")
             status = "filled" if (resp or {}).get("success") else "failed"
             log("LIVE %s %s size=%.2f @<=%.2f -> %s %s"
