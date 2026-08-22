@@ -1,87 +1,79 @@
-# linkhash-strategies
+# LinkHash Tactical
 
-Automated trading strategies for Polymarket crypto **15-minute up/down** markets,
-run on a dedicated server, isolated from the LinkHash web app.
+Automated trading bot for Polymarket crypto **15-minute up/down** markets, run on
+a dedicated server, isolated from the LinkHash web app.
 
 ## The edge (backtested)
 
-Backtest over **every stored 15m up/down window** (all 7 coins, ~Jul 19–Aug 21,
-3,197 BTC windows + all-coin), priced at the **real ask/bid** (not mid):
+Over **every stored 15m up/down window** (7 coins, ~33 days), priced at the real
+ask/bid:
 
 > In the closing minutes of a window, when the Chainlink price has **led** its
-> window-open price ("strike") by a small margin in one direction, and that
-> direction's token is **still cheap** (not yet fully priced in), buy that
-> direction. Settlement is a TWAP that has largely locked in, so the market is
-> under-pricing an already-decided outcome.
+> window-open price ("strike") by a small margin, and the leading side's token is
+> still **cheap** (≤80–85¢), buy that side. Settlement is a TWAP that has largely
+> locked in, so the market under-prices an already-decided outcome.
 
-Counter-intuitively, the profit is **not** in the "≤97¢ near-certain" bets (those
-are roughly break-even to −EV once you pay the ask) — it's in the moderately
-priced (≤80–85¢) leads the market hasn't caught up to. Per-coin tuned ROI:
+Per-coin tuned ROI (real ask fills): ETH +30% · BTC +22% · BNB/HYPE +20% ·
+SOL +15% · DOGE +15% · XRP +9%. Rules live in `RULES` atop `strategy_bot.py`.
 
-| Coin | when | lead ≥ | pay ≤ | win% | ROI/bet |
-|------|------|--------|-------|------|---------|
-| BTC  | 2 min left | 0.05% | 80¢ | 86% | **+22%** |
-| ETH  | 3 min left | 0.10% | 85¢ | 100% | **+30%** |
-| SOL  | 3 min left | 0.10% | 85¢ | 91% | +15% |
-| XRP  | 5 min left | 0.15% | 80¢ | 77% | +9% |
-| BNB  | 2 min left | 0.05% | 85¢ | 90% | +20% |
-| DOGE | 2 min left | 0.05% | 80¢ | 80% | +15% |
-| HYPE | 2 min left | 0.10% | 85¢ | 89% | +20% |
+`lead% = (current_chainlink − strike) / strike × 100`. Profit needs
+`win_rate > price_paid` — which is why cheap leads win, not "near-certain 97¢" bets.
 
-"lead" = `(current_chainlink − strike) / strike × 100`, where `strike` is the
-Chainlink price at the window's open (the "price to beat").
+⚠️ Backtest ≠ future. Top-of-book fills only. No fees modeled.
 
-Rules live in `RULES` at the top of `strategy_bot.py`.
+## Data sources — Polymarket-direct
 
-⚠️ Backtest ≠ future. Top-of-book fills only (large size slips). No fees modeled.
+Live signals use the same feeds any Polymarket trader has (lowest latency, fair):
 
-## Data source — fairness
+| Input | Source |
+|-------|--------|
+| Chainlink price / strike | Polymarket **RTDS** websocket (`crypto_prices_chainlink`) — a background thread keeps a per-coin price buffer; strike = buffered price at the window-open epoch |
+| Market discovery | Polymarket **Gamma** API (`/events?tag_slug=crypto`) → tokens + window |
+| Order book | public Polymarket **CLOB** (`/book`) — the real ask we'd pay |
+| Order placement | Polymarket **CLOB** (`py-clob-client`, signed) |
+| Settlement / P&L | LinkHash `/api/v1/settlements` — post-hoc accounting only (a free key is plenty) |
 
-Signals come **only from the public LinkHash Data API** (`/api/v1/*`) — the exact
-same interface any competitor can subscribe to (create a key at `/developers/`).
-The bot has **no privileged data access** (no direct ClickHouse), so the edge is
-the *strategy*, not the plumbing, and it runs on a level field with every entrant.
-It touches Polymarket directly only to **place orders** via the CLOB (which any
-trader does). Bonus: this also removes the ClickHouse IP-allowlist problem — the
-bot just needs an API key + internet, like anyone else.
+The bot must be running ~1 window (15 min) before it can trade — it needs the RTDS
+buffer to cover a window's open to know the strike.
 
-Endpoints used: `/api/v1/markets` (open windows + tokens + open/close times),
-`/api/v1/prices/chainlink` (strike @ open + current price → the "lead"),
-`/api/v1/markets/{id}/snapshots?limit=1` (live order book),
-`/api/v1/settlements` (outcomes → P&L). Polling is adaptive (fast near a window
-close, slow otherwise) to keep API usage modest — windows are on a fixed 15m grid.
+## Telegram
+
+Announces to the LinkHash group when it places a bet and, per settle batch, a
+combined result + running session totals (bets, W/L, win rate, cumulative %,
+realized PnL). Set `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`; `--test-telegram`
+checks connectivity. Real trades always post; dry-run only if `TELEGRAM_NOTIFY_DRY=1`.
 
 ## Safety
 
 Does **nothing live** unless `STRAT_ENABLED=1` **and** `STRAT_DRY_RUN=0` **and**
-`PM_PRIVATE_KEY` is set. Otherwise it runs in **dry-run**: logs the exact orders
-it *would* place and tracks hypothetical P&L. Rails: per-bet cap, max open
-exposure, cumulative realized-loss kill-switch, one bet per market (idempotent),
-stale-feed guards.
+`PM_PRIVATE_KEY` is set. Otherwise dry-run: logs would-be orders + hypothetical
+P&L. Rails: per-bet cap, max exposure, realized-loss kill-switch, one bet per
+market (idempotent), stale-feed guard, FAK orders (never pay above cap).
 
 ## Setup (fresh Ubuntu server)
 
 ```bash
-git clone https://<PAT>@github.com/<you>/linkhash-strategies.git
+sudo apt-get install -y python3-venv
+git clone https://<PAT>@github.com/puzzlecollector/LinkHash-Tactical.git linkhash-strategies
 cd linkhash-strategies
-cp .env.example .env && nano .env      # set LHX_API_KEY; leave STRAT_ENABLED=0 for now
+cp .env.example .env && nano .env      # set LHX_API_KEY (+ Telegram); leave STRAT_ENABLED=0
 bash setup.sh                          # venv + install + start service (dry-run)
 tail -f bot.log
 ```
 
-## Go live (only when ready)
+## Go live
 
-1. In `.env` set `PM_PRIVATE_KEY`, `PM_FUNDER`, `PM_SIG_TYPE` (1 browser-wallet /
-   2 email-wallet). Fund the wallet with USDC and set the CLOB USDC allowance.
-2. Start small: `STRAT_BET_USDC=1`, `STRAT_MAX_EXPOSURE=5`.
-3. Flip `STRAT_ENABLED=1`, keep `STRAT_DRY_RUN=1` one cycle to confirm signals.
-4. Set `STRAT_DRY_RUN=0` and `sudo systemctl restart linkhash-strategy-bot`.
+1. In `.env` set `PM_PRIVATE_KEY`, confirm `PM_FUNDER` + `PM_SIG_TYPE` (1 MetaMask).
+   Fund the wallet with USDC via the Polymarket UI (sets the CLOB allowance).
+2. Start small: `STRAT_BET_USDC=1`, `STRAT_MAX_EXPOSURE=8`.
+3. Flip `STRAT_ENABLED=1`, keep `STRAT_DRY_RUN=1` a while to confirm signals live.
+4. Set `STRAT_DRY_RUN=0`, `sudo systemctl restart linkhash-strategy-bot`.
 
 ## Commands
 
 ```bash
-./venv/bin/python strategy_bot.py --status         # positions + P&L
+./venv/bin/python strategy_bot.py --status         # positions + P&L + RTDS buffer
 ./venv/bin/python strategy_bot.py --once           # single cycle
-./venv/bin/python strategy_bot.py --once --settle-only
+./venv/bin/python strategy_bot.py --test-telegram  # send a test message
 sudo systemctl restart linkhash-strategy-bot       # after editing .env
 ```
