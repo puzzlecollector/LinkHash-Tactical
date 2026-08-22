@@ -112,11 +112,29 @@ PM_FUNDER    = os.environ.get("PM_FUNDER", "").strip()
 PM_SIG_TYPE  = envi("PM_SIG_TYPE", 2)
 PM_CHAIN     = envi("PM_CHAIN_ID", 137)
 
+# ---- Telegram announcements (public group) ----------------------------------
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TG_DRY   = envi("TELEGRAM_NOTIFY_DRY", 0) == 1   # also announce dry-run bets?
+
 LIVE = ENABLED and not DRY_RUN and bool(PM_KEY)
 
 
 def log(*a):
     print(datetime.now(timezone.utc).strftime("%H:%M:%S"), *a, flush=True)
+
+
+def tg_send(text):
+    """Post to the LinkHash Telegram group. No-op if unconfigured; never raises
+    (a notification failure must never interfere with trading)."""
+    if not (TG_TOKEN and TG_CHAT):
+        return
+    try:
+        _session.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML",
+                            "disable_web_page_preview": True}, timeout=10)
+    except Exception as e:
+        log("telegram error: %r" % e)
 
 
 def _epoch(s):
@@ -204,6 +222,19 @@ def realized_pnl(con, dry):
     r = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades "
                     "WHERE outcome IS NOT NULL AND dry=?", (1 if dry else 0,)).fetchone()
     return float(r[0] or 0)
+
+
+def session_stats(con, dry):
+    """Aggregate settled trades for the Telegram summary. cumulative % = the sum
+    of each settled bet's own return % (money-out − money-in ÷ money-in)."""
+    rs = con.execute("SELECT notional, pnl FROM trades WHERE outcome IS NOT NULL AND dry=?",
+                     (1 if dry else 0,)).fetchall()
+    n = len(rs)
+    wins = sum(1 for _nt, p in rs if (p or 0) > 0)
+    pnl = sum((p or 0) for _nt, p in rs)
+    cum = sum(((p or 0) / nt * 100) for nt, p in rs if nt)
+    return dict(n=n, wins=wins, losses=n - wins, pnl=pnl, cum=cum,
+                wr=(wins / n * 100 if n else 0))
 
 
 # ---- CLOB client (lazy; only if LIVE) ---------------------------------------
@@ -362,6 +393,13 @@ def execute(con, sig):
          sig["t_left"], sig["lead"], sig["deadline"], dry))
     con.commit()
 
+    if status in ("filled", "dry") and ((not dry) or TG_DRY):
+        arrow = "🟢 UP" if sig["direction"] == "UP" else "🔴 DOWN"
+        tg_send(("[DRY] " if dry else "") +
+                "🎯 <b>LinkHash strategy — bet placed</b>\n"
+                f"{sig['asset']} {arrow}  ${round(size * entry, 2)} @ {entry * 100:.1f}¢\n"
+                f"lead {sig['lead']:+.3f}% · {sig['t_left']}s left")
+
 
 # ---- settlement -------------------------------------------------------------
 def settle(con):
@@ -372,6 +410,7 @@ def settle(con):
         (now - SETTLE_GRACE,)).fetchall()
     if not todo:
         return
+    settled_now = []
     by_asset = {}
     for row in todo:
         by_asset.setdefault(row[1], []).append(row)
@@ -395,7 +434,21 @@ def settle(con):
             con.execute("UPDATE trades SET outcome=?, pnl=?, status=? WHERE market_id=?",
                         (outcome, pnl, "settled_win" if won else "settled_loss", mid))
             log("SETTLE %s %s %s pnl=%+.3f" % (asset, direction, outcome, pnl))
+            settled_now.append(dict(asset=asset, direction=direction, outcome=outcome,
+                                    pnl=pnl, won=won, dry=dry))
     con.commit()
+
+    # One combined Telegram summary per settle batch (real trades always; dry
+    # only if TELEGRAM_NOTIFY_DRY). Shows results + running session totals.
+    notify = [s for s in settled_now if (not s["dry"]) or TG_DRY]
+    if notify:
+        lines = [("[DRY] " if s["dry"] else "") +
+                 f"{'✅' if s['won'] else '❌'} {s['asset']} {s['direction']} → "
+                 f"{s['outcome']}  {s['pnl']:+.2f}$" for s in notify]
+        st = session_stats(con, dry=notify[0]["dry"])
+        lines.append(f"📊 <b>Session</b>: {st['n']} bets · {st['wins']}W/{st['losses']}L "
+                     f"({st['wr']:.0f}%) · cumulative {st['cum']:+.1f}% · PnL {st['pnl']:+.2f}$")
+        tg_send("\n".join(lines))
 
 
 # ---- status -----------------------------------------------------------------
@@ -406,6 +459,8 @@ def status(con):
     print("coins:", ",".join(COINS))
     print("bet=%.0f max_exposure=%.0f max_loss=%.0f | db=%s" %
           (BET_USDC, MAX_EXPOSURE, MAX_LOSS, DB_PATH))
+    print("telegram:", ("on" if (TG_TOKEN and TG_CHAT) else "off"),
+          "(notify_dry=%d)" % (1 if TG_DRY else 0))
     for dry in (0, 1):
         tag = "DRY" if dry else "REAL"
         n = con.execute("SELECT COUNT(*) FROM trades WHERE dry=?", (dry,)).fetchone()[0]
@@ -440,12 +495,20 @@ def main():
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--settle-only", action="store_true")
+    ap.add_argument("--test-telegram", action="store_true")
     ap.add_argument("--interval", type=float, default=None)
     args = ap.parse_args()
 
     con = db()
     if args.status:
         status(con)
+        return
+    if args.test_telegram:
+        if not (TG_TOKEN and TG_CHAT):
+            print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set in .env")
+        else:
+            tg_send("✅ <b>LinkHash strategy bot</b> connected — announcements are live.")
+            print("test message sent — check the group")
         return
     log("strategy bot start | mode=%s coins=%s bet=%.0f api=%s" %
         ("LIVE" if LIVE else ("DRY" if ENABLED else "DISABLED"), ",".join(COINS), BET_USDC, API_BASE))
