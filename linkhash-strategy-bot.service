@@ -1,0 +1,17 @@
+[Unit]
+Description=LinkHash strategy bot — Polymarket 15m up/down edge trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/linkhash-strategies
+ExecStart=/home/ubuntu/linkhash-strategies/venv/bin/python /home/ubuntu/linkhash-strategies/strategy_bot.py --loop --interval 6
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ubuntu/linkhash-strategies/bot.log
+StandardError=append:/home/ubuntu/linkhash-strategies/bot.log
+
+[Install]
+WantedBy=multi-user.target
