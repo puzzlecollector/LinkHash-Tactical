@@ -35,12 +35,21 @@ Rules live in `RULES` at the top of `strategy_bot.py`.
 
 ⚠️ Backtest ≠ future. Top-of-book fills only (large size slips). No fees modeled.
 
-## Data source
+## Data source — fairness
 
-The bot reads live market state (open windows, Chainlink prices, order books,
-settlements) from the **LinkHash ClickHouse** (`linkhash.*` tables), the same
-real-time feed the collector fills. It never scrapes Polymarket for signals —
-only to **place orders** via the CLOB.
+Signals come **only from the public LinkHash Data API** (`/api/v1/*`) — the exact
+same interface any competitor can subscribe to (create a key at `/developers/`).
+The bot has **no privileged data access** (no direct ClickHouse), so the edge is
+the *strategy*, not the plumbing, and it runs on a level field with every entrant.
+It touches Polymarket directly only to **place orders** via the CLOB (which any
+trader does). Bonus: this also removes the ClickHouse IP-allowlist problem — the
+bot just needs an API key + internet, like anyone else.
+
+Endpoints used: `/api/v1/markets` (open windows + tokens + open/close times),
+`/api/v1/prices/chainlink` (strike @ open + current price → the "lead"),
+`/api/v1/markets/{id}/snapshots?limit=1` (live order book),
+`/api/v1/settlements` (outcomes → P&L). Polling is adaptive (fast near a window
+close, slow otherwise) to keep API usage modest — windows are on a fixed 15m grid.
 
 ## Safety
 
@@ -55,12 +64,10 @@ stale-feed guards.
 ```bash
 git clone https://<PAT>@github.com/<you>/linkhash-strategies.git
 cd linkhash-strategies
-cp .env.example .env && nano .env      # fill ClickHouse creds; leave STRAT_ENABLED=0 for now
+cp .env.example .env && nano .env      # set LHX_API_KEY; leave STRAT_ENABLED=0 for now
 bash setup.sh                          # venv + install + start service (dry-run)
 tail -f bot.log
 ```
-
-Add the bot server's public IP to the ClickHouse Cloud allowlist if enabled.
 
 ## Go live (only when ready)
 

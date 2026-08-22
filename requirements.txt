@@ -1,3 +1,3 @@
 py-clob-client
-clickhouse-connect
+requests
 python-dotenv

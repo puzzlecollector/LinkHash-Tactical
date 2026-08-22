@@ -10,6 +10,11 @@ up/down window, priced at the real ask/bid):
   (settlement is a TWAP that has mostly locked in). Backtest ROI (ask-based):
       BTC +22% · ETH +30% · SOL +15% · XRP +9% · BNB +20% · DOGE +15% · HYPE +20%
 
+FAIRNESS: signals come ONLY from the *public* LinkHash Data API (/api/v1/*) —
+the exact same interface every competitor can subscribe to. The bot has no
+privileged data access; the edge is the strategy, not the plumbing. It touches
+Polymarket directly only to PLACE orders (which anyone does).
+
 SAFETY — this bot does NOTHING live unless ALL are true:
     STRAT_ENABLED=1   AND   STRAT_DRY_RUN=0   AND   PM_PRIVATE_KEY present.
 Otherwise it runs in DRY-RUN: it detects + logs the exact orders it *would*
@@ -24,14 +29,27 @@ Standalone (NO Django). Reads all config from a `.env` beside this file.
 
     python strategy_bot.py --status          # positions + P&L, exits
     python strategy_bot.py --once            # one scan/execute/settle cycle
-    python strategy_bot.py --loop            # daemon (systemd)
+    python strategy_bot.py --loop            # daemon (systemd; adaptive polling)
     python strategy_bot.py --once --settle-only
 """
 import argparse
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
+
+import requests
+
+CYCLE_SEC = 900   # 15m window length
+
+
+def slug_epoch(market_id):
+    """Window START (unix) from a slug like 'btc-updown-15m-1787394600'. The
+    trailing number IS the open time; close = start + CYCLE_SEC. This is the
+    canonical reference — do NOT use market_meta.opened_at (that's first-seen)."""
+    m = re.search(r"-(\d{9,11})(?:$|\D)", market_id or "")
+    return int(m.group(1)) if m else None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -68,6 +86,11 @@ RULES = {
     "HYPE": dict(n=120, lead=0.10, cap=0.85),
 }
 
+# ---- public LinkHash Data API (same interface competitors use) ---------------
+API_BASE = os.environ.get("LHX_API_BASE", "https://link-hash.com").rstrip("/")
+API_KEY  = os.environ.get("LHX_API_KEY", "").strip()
+VENUE    = os.environ.get("STRAT_VENUE", "polymarket")
+
 ENABLED      = envi("STRAT_ENABLED", 0) == 1
 DRY_RUN      = envi("STRAT_DRY_RUN", 1) == 1
 BET_USDC     = envf("STRAT_BET_USDC", 5)
@@ -79,6 +102,8 @@ FIRE_BAND    = envi("STRAT_FIRE_BAND", 45)   # act within (n-BAND, n] seconds le
 MIN_TLEFT    = envi("STRAT_MIN_TLEFT", 15)   # need this many secs to fill
 STALE_SEC    = envi("STRAT_STALE_SEC", 20)   # chainlink/orderbook must be fresher
 SETTLE_GRACE = envi("STRAT_SETTLE_GRACE", 180)
+LOOP_MIN     = envf("STRAT_INTERVAL", 6)     # fast poll near a window close
+LOOP_MAX     = envf("STRAT_INTERVAL_IDLE", 30)  # slow poll when all windows far
 DB_PATH      = os.environ.get("STRAT_DB", os.path.join(HERE, "strategy_bot.sqlite3"))
 
 PM_HOST      = os.environ.get("PM_HOST", "https://clob.polymarket.com")
@@ -94,36 +119,68 @@ def log(*a):
     print(datetime.now(timezone.utc).strftime("%H:%M:%S"), *a, flush=True)
 
 
-# ---- ClickHouse (direct; proxy-cleared for ClickHouse Cloud) -----------------
-_PROXY = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy")
-_ch = None
+def _epoch(s):
+    """ISO string (from the API) -> unix seconds (UTC)."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
 
 
-def ch():
-    global _ch
-    if _ch is None:
-        import clickhouse_connect
-        saved = {k: os.environ.pop(k, None) for k in _PROXY}
-        try:
-            _ch = clickhouse_connect.get_client(
-                host=os.environ["CLICKHOUSE_HOST"],
-                port=int(os.environ.get("CLICKHOUSE_PORT", "8443")),
-                username=os.environ.get("CLICKHOUSE_USER", "default"),
-                password=os.environ.get("CLICKHOUSE_PASSWORD"),
-                database=os.environ.get("CLICKHOUSE_DB", "linkhash"),
-                secure=True, connect_timeout=10, send_receive_timeout=30,
-            )
-        finally:
-            for k, v in saved.items():
-                if v is not None:
-                    os.environ[k] = v
-    return _ch
+def _iso(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
 
 
-def rows(sql):
-    res = ch().query(sql)
-    cols = res.column_names
-    return [dict(zip(cols, r)) for r in res.result_rows]
+# ---- API client -------------------------------------------------------------
+_session = requests.Session()
+
+
+def api_get(path, **params):
+    headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+    r = _session.get(API_BASE + path, params={k: v for k, v in params.items() if v is not None},
+                     headers=headers, timeout=15)
+    r.raise_for_status()
+    j = r.json()
+    if not j.get("ok"):
+        raise RuntimeError("API %s: %s" % (path, j.get("message") or j.get("error") or j))
+    return j.get("data")
+
+
+_strike_cache = {}   # market_id -> strike (window-open price is fixed once open)
+
+
+def chainlink_at(asset, at_epoch, market_id=None):
+    """Chainlink price at/just-before a timestamp (the window-open strike).
+    Cached per market — a window's open price never changes once set."""
+    if market_id and market_id in _strike_cache:
+        return _strike_cache[market_id]
+    d = api_get("/api/v1/prices/chainlink", asset=asset,
+                start=_iso(at_epoch - 120), end=_iso(at_epoch), limit=1)
+    val = float(d[0]["price"]) if d else None
+    if market_id and val:
+        _strike_cache[market_id] = val
+        if len(_strike_cache) > 512:      # bound it
+            _strike_cache.pop(next(iter(_strike_cache)))
+    return val
+
+
+def chainlink_now(asset):
+    d = api_get("/api/v1/prices/chainlink", asset=asset, limit=1)
+    if not d:
+        return None, None
+    return float(d[0]["price"]), _epoch(d[0]["ts"])
+
+
+def orderbook_now(market_id):
+    d = api_get(f"/api/v1/markets/{market_id}/snapshots", limit=1)
+    if not d:
+        return None
+    return d[0]  # {ts, best_bid, best_ask, mid_price, ...}
 
 
 # ---- persistence ------------------------------------------------------------
@@ -178,58 +235,79 @@ def token_best_ask(token_id):
 
 
 # ---- signal scan ------------------------------------------------------------
-def scan():
-    """Return live signals meeting each coin's rule, ready to (maybe) execute."""
-    now = int(time.time())
-    coin_filter = "','".join(COINS)
-    meta = rows(f"""
-        SELECT asset,
-               argMin(market_id, deadline_at)  mid,
-               toUnixTimestamp(min(deadline_at)) dl,
-               toUnixTimestamp(argMin(opened_at, deadline_at)) op,
-               argMin(token_yes, deadline_at)  ty,
-               argMin(token_no, deadline_at)   tn
-        FROM linkhash.market_meta
-        WHERE cycle='15m' AND asset IN ('{coin_filter}')
-          AND deadline_at > now() AND opened_at <= now()
-        GROUP BY asset""")
-    sigs = []
-    for m in meta:
-        a = m["asset"]
+def open_windows():
+    """Current open 15m window per coin, via the public markets endpoint.
+    Window start/close are derived from the slug epoch (canonical), not from
+    market_meta timestamps."""
+    data = api_get("/api/v1/markets", cycle="15m", venue=VENUE) or []
+    now = time.time()
+    out = []
+    for m in data:
+        a = (m.get("asset") or "").upper()
         if a not in RULES:
             continue
+        mid = m.get("market_id")
+        start = slug_epoch(mid)
+        if not start:
+            continue
+        close = start + CYCLE_SEC
+        out.append(dict(asset=a, market_id=mid, start=start, close=close,
+                        ty=m.get("token_yes"), tn=m.get("token_no"),
+                        t_left=int(close - now)))
+    return out
+
+
+def signals_from(windows):
+    now = time.time()
+    sigs = []
+    for w in windows:
+        a = w["asset"]
         rule = RULES[a]
-        t_left = int(m["dl"]) - now
+        t_left = int(w["close"] - now)
         if not (rule["n"] - FIRE_BAND < t_left <= rule["n"]) or t_left < MIN_TLEFT:
             continue
-        sr = rows(f"SELECT price p, toUnixTimestamp(ts) t FROM linkhash.chainlink_price "
-                  f"WHERE asset='{a}' AND ts<=fromUnixTimestamp({int(m['op'])}) ORDER BY ts DESC LIMIT 1")
-        cur = rows(f"SELECT price p, toUnixTimestamp(ts) t FROM linkhash.chainlink_price "
-                   f"WHERE asset='{a}' ORDER BY ts DESC LIMIT 1")
-        ob = rows(f"SELECT best_bid bid, best_ask ask, toUnixTimestamp(ts) t "
-                  f"FROM linkhash.orderbook_snapshot WHERE market_id='{m['mid']}' ORDER BY ts DESC LIMIT 1")
-        if not (sr and cur and ob):
+        strike = chainlink_at(a, w["start"], market_id=w["market_id"])
+        price, cts = chainlink_now(a)
+        ob = orderbook_now(w["market_id"])
+        if not (strike and price and ob):
             continue
-        if now - int(cur[0]["t"]) > STALE_SEC or now - int(ob[0]["t"]) > STALE_SEC:
+        if (cts and now - cts > STALE_SEC) or \
+           (ob.get("ts") and now - _epoch(ob["ts"]) > STALE_SEC):
             continue  # stale feed — do not trust
-        strike = float(sr[0]["p"] or 0)
-        price = float(cur[0]["p"] or 0)
         if strike <= 0:
             continue
         lead = (price - strike) / strike * 100.0
         if abs(lead) < rule["lead"]:
             continue
         direction = "UP" if lead > 0 else "DN"
-        bid = float(ob[0]["bid"] or 0)
-        ask = float(ob[0]["ask"] or 0)
+        bid = float(ob.get("best_bid") or 0)
+        ask = float(ob.get("best_ask") or 0)
         entry_est = ask if direction == "UP" else (1.0 - bid)   # snapshot estimate
-        token = m["ty"] if direction == "UP" else m["tn"]
+        token = w["ty"] if direction == "UP" else w["tn"]
         if not token or not (0 < entry_est <= rule["cap"]):
             continue
-        sigs.append(dict(asset=a, market_id=m["mid"], direction=direction,
+        sigs.append(dict(asset=a, market_id=w["market_id"], direction=direction,
                          token_id=token, cap=rule["cap"], entry_est=entry_est,
-                         lead=round(lead, 3), t_left=t_left, deadline=int(m["dl"])))
+                         lead=round(lead, 3), t_left=t_left, deadline=int(w["close"])))
     return sigs
+
+
+def next_sleep(windows):
+    """Adaptive: poll fast when a window is in (or near) its firing band, slow
+    otherwise. Keeps API usage modest (windows are on a fixed 15m grid)."""
+    now = time.time()
+    soonest = None
+    for w in windows:
+        rule = RULES[w["asset"]]
+        t_left = w["close"] - now
+        if rule["n"] - FIRE_BAND < t_left <= rule["n"]:
+            return LOOP_MIN
+        d = t_left - rule["n"]            # time until this coin enters its band
+        if d > 0:
+            soonest = d if soonest is None else min(soonest, d)
+    if soonest is None:
+        return LOOP_MIN
+    return max(LOOP_MIN, min(soonest, LOOP_MAX))
 
 
 # ---- execution --------------------------------------------------------------
@@ -292,20 +370,31 @@ def settle(con):
         "SELECT market_id,asset,direction,entry_price,size,notional,dry FROM trades "
         "WHERE outcome IS NULL AND status IN ('placed','filled','dry') AND deadline < ?",
         (now - SETTLE_GRACE,)).fetchall()
-    for mid, asset, direction, entry, size, notional, dry in todo:
-        r = rows(f"SELECT outcome FROM linkhash.market_settlement FINAL "
-                 f"WHERE market_id='{mid}' LIMIT 1")
-        if not r:
+    if not todo:
+        return
+    by_asset = {}
+    for row in todo:
+        by_asset.setdefault(row[1], []).append(row)
+    for asset, items in by_asset.items():
+        try:
+            setts = api_get("/api/v1/settlements", asset=asset, venue=VENUE,
+                            cycle="15m", limit=500) or []
+        except Exception as e:
+            log("settle fetch error %s: %r" % (asset, e))
             continue
-        outcome = (r[0]["outcome"] or "").upper()
-        won = (outcome == "YES" and direction == "UP") or (outcome == "NO" and direction == "DN")
-        if dry:
-            pnl = round((1.0 - entry) * size if won else -entry * size, 4)
-        else:
-            pnl = round((size - notional) if won else -notional, 4)  # ~ shares*1 - cost
-        con.execute("UPDATE trades SET outcome=?, pnl=?, status=? WHERE market_id=?",
-                    (outcome, pnl, "settled_win" if won else "settled_loss", mid))
-        log("SETTLE %s %s %s pnl=%+.3f" % (asset, direction, outcome, pnl))
+        omap = {s.get("market_id"): (s.get("outcome") or "").upper() for s in setts}
+        for mid, _a, direction, entry, size, notional, dry in items:
+            outcome = omap.get(mid)
+            if not outcome:
+                continue
+            won = (outcome == "YES" and direction == "UP") or (outcome == "NO" and direction == "DN")
+            if dry:
+                pnl = round((1.0 - entry) * size if won else -entry * size, 4)
+            else:
+                pnl = round((size - notional) if won else -notional, 4)
+            con.execute("UPDATE trades SET outcome=?, pnl=?, status=? WHERE market_id=?",
+                        (outcome, pnl, "settled_win" if won else "settled_loss", mid))
+            log("SETTLE %s %s %s pnl=%+.3f" % (asset, direction, outcome, pnl))
     con.commit()
 
 
@@ -313,7 +402,8 @@ def settle(con):
 def status(con):
     mode = "LIVE (real orders)" if LIVE else ("DRY-RUN" if ENABLED else "DISABLED->dry")
     print("=== strategy bot status ===")
-    print("mode:", mode, "| coins:", ",".join(COINS))
+    print("mode:", mode, "| api:", API_BASE, "| key:", "set" if API_KEY else "MISSING")
+    print("coins:", ",".join(COINS))
     print("bet=%.0f max_exposure=%.0f max_loss=%.0f | db=%s" %
           (BET_USDC, MAX_EXPOSURE, MAX_LOSS, DB_PATH))
     for dry in (0, 1):
@@ -337,9 +427,11 @@ def status(con):
 def cycle(con, settle_only=False):
     settle(con)
     if settle_only:
-        return
-    for sig in scan():
+        return []
+    windows = open_windows()
+    for sig in signals_from(windows):
         execute(con, sig)
+    return windows
 
 
 def main():
@@ -348,22 +440,23 @@ def main():
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--settle-only", action="store_true")
-    ap.add_argument("--interval", type=float, default=6.0)
+    ap.add_argument("--interval", type=float, default=None)
     args = ap.parse_args()
 
     con = db()
     if args.status:
         status(con)
         return
-    log("strategy bot start | mode=%s coins=%s bet=%.0f" %
-        ("LIVE" if LIVE else ("DRY" if ENABLED else "DISABLED"), ",".join(COINS), BET_USDC))
+    log("strategy bot start | mode=%s coins=%s bet=%.0f api=%s" %
+        ("LIVE" if LIVE else ("DRY" if ENABLED else "DISABLED"), ",".join(COINS), BET_USDC, API_BASE))
     if args.loop:
         while True:
             try:
-                cycle(con, args.settle_only)
+                windows = cycle(con, args.settle_only)
             except Exception as e:
                 log("cycle error: %r" % e)
-            time.sleep(args.interval)
+                windows = []
+            time.sleep(args.interval or next_sleep(windows))
     else:
         cycle(con, args.settle_only)
 
