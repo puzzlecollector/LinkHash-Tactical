@@ -427,18 +427,19 @@ def execute(con, sig):
                 log("skip %s: live ask %s > cap %.2f" % (sig["asset"], ask, sig["cap"]))
                 return
             entry = ask
-            size = round(BET_USDC / max(entry, 0.01), 2)
-            if size * entry < 1.0:      # Polymarket min order ~ $1
-                size = round(1.0 / entry, 2)
-            from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions as _OPT
+            amount = round(max(BET_USDC, 1.0), 2)              # USDC to spend (>= $1 min)
+            size = round(amount / max(entry, 0.01), 2)         # shares, for the record
+            from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions as _OPT
             try:
                 from py_clob_client_v2 import Side as _Side; _buy = _Side.BUY
             except Exception:
                 from py_clob_client_v2.order_builder.constants import BUY as _buy
-            # PartialCreateOrderOptions: neg_risk left None -> client auto-detects it.
-            resp = clob().create_and_post_order(               # marketable FAK at cap
-                order_args=OrderArgs(token_id=sig["token_id"], price=sig["cap"],
-                                     size=size, side=_buy),
+            # Market BUY of `amount` USDC, capped at `cap` (worst price), FAK. Passing a
+            # USDC amount lets the client round maker/taker amounts to valid decimals;
+            # neg_risk (options=None) is auto-detected per token.
+            resp = clob().create_and_post_market_order(
+                order_args=MarketOrderArgs(token_id=sig["token_id"], amount=float(amount),
+                                           side=_buy, price=sig["cap"]),
                 options=_OPT(tick_size=tick_size(sig["token_id"])),
                 order_type=OrderType.FAK)
             order_id = (resp or {}).get("orderID") or (resp or {}).get("orderId")
