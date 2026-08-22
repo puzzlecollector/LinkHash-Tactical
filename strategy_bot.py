@@ -453,6 +453,9 @@ def execute(con, sig):
         log("DRY  %s %s size=%.2f entry~%.3f cap<=%.2f lead=%+.3f%% t_left=%ds"
             % (sig["asset"], sig["direction"], size, entry, sig["cap"], sig["lead"], sig["t_left"]))
 
+    if status == "failed":
+        return   # don't record — let the next cycle retry this window while in band
+
     con.execute("""INSERT OR IGNORE INTO trades(market_id,asset,direction,token_id,cap,
         entry_price,size,notional,placed_at,order_id,status,t_left,lead,deadline,dry)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
