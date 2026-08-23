@@ -70,13 +70,6 @@ def envi(name, default):
         return int(default)
 
 
-# Per-coin rules (v2 — "strong lead + market-favorite" strategy):
-#   n    = seconds-left at which to act (within the final 5 minutes)
-#   lead = MIN |chainlink move %| vs the window-open strike (per-coin, tuned)
-# We BUY the market FAVORITE (the higher-priced side, must be in [FAV_FLOOR,
-# FAV_CEIL]) only when the chainlink lead is strong enough AND points the same
-# way. High win rate at these strong leads makes the favorite +EV (win>price).
-# XRP is EXCLUDED — its short-term moves mean-revert, so leads don't persist.
 # v3 — "underlying-first": the CHAINLINK move (lead) is the primary signal, not the
 # (manipulable) token price. When the coin has moved >= lead% and that direction is
 # still cheap (ask <= ceil, i.e. not yet priced in), buy it. Per-coin:
