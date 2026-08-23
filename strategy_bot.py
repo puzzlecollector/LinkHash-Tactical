@@ -304,6 +304,10 @@ def db():
         cap REAL, entry_price REAL, size REAL, notional REAL, placed_at INT,
         order_id TEXT, status TEXT, t_left INT, lead REAL, deadline INT,
         outcome TEXT, pnl REAL, dry INT)""")
+    try:
+        con.execute("ALTER TABLE trades ADD COLUMN sell_status TEXT")  # NULL until a 99c sell rests
+    except Exception:
+        pass  # column already exists
     return con
 
 
@@ -487,28 +491,8 @@ def execute(con, sig):
          round(size * entry, 2), int(time.time()), order_id, status,
          sig["t_left"], sig["lead"], sig["deadline"], dry))
     con.commit()
-
-    # After a real fill, rest a limit SELL at SELL_AT (e.g. 0.99) so a winning
-    # position can exit early (maker, no fee, avoids a last-minute reversal). If
-    # unfilled it auto-cancels at window close and we redeem at $1. Sell an
-    # INTEGER share count so shares×0.99 has ≤2 decimals (avoids "invalid amounts").
-    if LIVE and status == "filled" and SELL_AT > 0:
-        try:
-            sell_sz = int(size)               # floor to whole shares we hold
-            if sell_sz >= 1:
-                from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions as _OPT2
-                try:
-                    from py_clob_client_v2 import Side as _S2; _sell = _S2.SELL
-                except Exception:
-                    from py_clob_client_v2.order_builder.constants import SELL as _sell
-                sresp = clob().create_and_post_order(
-                    order_args=OrderArgs(token_id=sig["token_id"], price=SELL_AT,
-                                         size=float(sell_sz), side=_sell),
-                    options=_OPT2(tick_size=tick_size(sig["token_id"])),
-                    order_type=OrderType.GTC)
-                log("  +limit SELL %d @ %.2f -> %s" % (sell_sz, SELL_AT, (sresp or {}).get("status")))
-        except Exception as e:
-            log("  sell-order err: %r" % e)
+    # The 99c limit SELL is placed by place_pending_sells() on a later cycle —
+    # a fresh fill's shares aren't sellable for a few seconds (on-chain settle).
 
     if status in ("filled", "dry") and ((not dry) or TG_DRY):
         arrow = "🟢 UP" if sig["direction"] == "UP" else "🔴 DOWN"
@@ -516,6 +500,48 @@ def execute(con, sig):
                 "🎯 <b>LinkHash strategy — bet placed</b>\n"
                 f"{sig['asset']} {arrow}  ${round(size * entry, 2)} @ {entry * 100:.1f}¢\n"
                 f"lead {sig['lead']:+.3f}% · {sig['t_left']}s left")
+
+
+def place_pending_sells(con):
+    """Rest a limit SELL at SELL_AT on filled positions, once their shares are
+    sellable. A fresh fill's balance lands a few seconds later (on-chain settle),
+    so we retry across cycles. Integer share count → shares×0.99 stays ≤2 dp."""
+    if not (LIVE and SELL_AT > 0):
+        return
+    now = int(time.time())
+    rows = con.execute(
+        "SELECT market_id, token_id, size, deadline FROM trades "
+        "WHERE status='filled' AND dry=0 AND sell_status IS NULL AND deadline > ?",
+        (now + 20,)).fetchall()
+    if not rows:
+        return
+    from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions as _OPT2
+    try:
+        from py_clob_client_v2 import Side as _S2; _sell = _S2.SELL
+    except Exception:
+        from py_clob_client_v2.order_builder.constants import SELL as _sell
+    for mid, token, size, _deadline in rows:
+        sell_sz = int(size or 0)
+        if sell_sz < 1:
+            con.execute("UPDATE trades SET sell_status='skip' WHERE market_id=?", (mid,))
+            continue
+        try:
+            resp = clob().create_and_post_order(
+                order_args=OrderArgs(token_id=token, price=SELL_AT, size=float(sell_sz), side=_sell),
+                options=_OPT2(tick_size=tick_size(token)), order_type=OrderType.GTC)
+            if (resp or {}).get("success"):
+                con.execute("UPDATE trades SET sell_status='resting' WHERE market_id=?", (mid,))
+                log("SELL rest %d @ %.2f  %s" % (sell_sz, SELL_AT, mid[:26]))
+            else:
+                log("sell rejected %s: %s" % (mid[:16], resp))
+        except Exception as e:
+            msg = str(e).lower()
+            if "balance" in msg and "enough" in msg:
+                pass  # shares not settled into a sellable balance yet — retry next cycle
+            else:
+                con.execute("UPDATE trades SET sell_status='err' WHERE market_id=?", (mid,))
+                log("sell err %s: %r" % (mid[:16], e))
+    con.commit()
 
 
 # ---- settlement (P&L accounting via LinkHash /settlements = observation) -----
@@ -603,6 +629,7 @@ def cycle(con, settle_only=False):
     windows = open_windows()
     for sig in signals_from(windows):
         execute(con, sig)
+    place_pending_sells(con)   # rest 99c sells on filled positions (retries until sellable)
     return windows
 
 
