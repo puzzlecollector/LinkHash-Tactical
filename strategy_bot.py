@@ -209,6 +209,46 @@ def start_rtds():
     threading.Thread(target=_rtds_thread, daemon=True).start()
 
 
+def _iso_to_epoch(s):
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def backfill_prices(minutes=25):
+    """Seed the price buffer from recent LinkHash Chainlink history so the bot can
+    evaluate windows immediately after a restart (no ~15-min warmup blind spot,
+    which was making it miss windows that opened just before a redeploy)."""
+    if not LHX_KEY:
+        log("backfill skipped (no LHX key)")
+        return
+    from datetime import timedelta
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(minutes=minutes)
+    for a in RULES:
+        try:
+            d = lhx_get("/api/v1/prices/chainlink", asset=a,
+                        start=start.isoformat(), end=end.isoformat(), limit=5000) or []
+            pts = sorted(((_iso_to_epoch(r.get("ts")), float(r["price"]))
+                          for r in d if r.get("ts") and r.get("price")),
+                         key=lambda x: x[0] or 0)
+            with _plock:
+                for ts, pr in pts:
+                    if ts:
+                        BUF[a].append((ts, pr))
+                if pts:
+                    PRICE[a] = (pts[-1][1], pts[-1][0])
+            log("backfill %s: %d prices" % (a, len(pts)))
+        except Exception as e:
+            log("backfill %s err: %r" % (a, e))
+
+
 def strike_at(asset, epoch):
     """Buffered Chainlink price at/just-before the window-open epoch = the strike.
     None until the buffer covers that time (bot needs ~1 window of warmup)."""
@@ -658,6 +698,7 @@ def main():
     log("strategy bot start | mode=%s coins=%s bet=%.0f" %
         ("LIVE" if LIVE else ("DRY" if ENABLED else "DISABLED"), ",".join(COINS), BET_USDC))
     start_rtds()
+    backfill_prices()   # seed the buffer so a restart doesn't miss recent windows
     if args.loop:
         while True:
             try:
