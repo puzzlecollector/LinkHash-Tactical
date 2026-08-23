@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """LinkHash strategy bot — Polymarket crypto 15m up/down edge trader.
 
-STRATEGY (per-coin, tuned from a backtest of every stored BTC + all-coin 15m
-up/down window, priced at the real ask/bid):
-  In the final minutes of a 15m window, when the Chainlink price has *led* its
-  window-open price ("strike") by >= LEAD% in one direction AND that direction's
-  token is still buyable at <= CAP cents, BUY that direction. The edge is that
-  the market under-prices an already-established lead in the closing minutes
-  (settlement is a TWAP that has mostly locked in). Backtest ROI (ask-based):
-      BTC +22% · ETH +30% · SOL +15% · XRP +9% · BNB +20% · DOGE +15% · HYPE +20%
+STRATEGY v2 (per-coin, tuned + fee-adjusted on all stored 15m windows):
+  In the final minutes of a 15m window, only when the Chainlink price has led its
+  window-open "strike" by a STRONG per-coin margin (LEAD%), buy the MARKET
+  FAVORITE (the higher-priced side) — provided the lead agrees with the favorite
+  and the favorite is priced in [FAV_FLOOR, FAV_CEIL]. At a strong lead the win
+  rate exceeds the price paid (win > price ⇒ +EV); weak leads / cheap "underdog"
+  sides are skipped (they were -EV live). XRP excluded (its moves mean-revert).
+  Fee-adjusted net ROI/bet: ETH +5% · HYPE +4% · SOL +3% · DOGE +3% · BNB +2% · BTC +5%.
 
 DATA SOURCES — Polymarket-direct (same feeds any Polymarket trader has, lowest
 latency, fair):
@@ -69,17 +69,23 @@ def envi(name, default):
         return int(default)
 
 
-# Per-coin rules: n = seconds-left at which to act, lead = min |move%| vs strike,
-# cap = max price (cents/100) we'll pay for the leading side.
+# Per-coin rules (v2 — "strong lead + market-favorite" strategy):
+#   n    = seconds-left at which to act (within the final 5 minutes)
+#   lead = MIN |chainlink move %| vs the window-open strike (per-coin, tuned)
+# We BUY the market FAVORITE (the higher-priced side, must be in [FAV_FLOOR,
+# FAV_CEIL]) only when the chainlink lead is strong enough AND points the same
+# way. High win rate at these strong leads makes the favorite +EV (win>price).
+# XRP is EXCLUDED — its short-term moves mean-revert, so leads don't persist.
 RULES = {
-    "BTC":  dict(n=120, lead=0.05, cap=0.80),
-    "ETH":  dict(n=180, lead=0.10, cap=0.85),
-    "SOL":  dict(n=180, lead=0.10, cap=0.85),
-    "XRP":  dict(n=300, lead=0.15, cap=0.80),
-    "BNB":  dict(n=120, lead=0.05, cap=0.85),
-    "DOGE": dict(n=120, lead=0.05, cap=0.80),
-    "HYPE": dict(n=120, lead=0.10, cap=0.85),
+    "BTC":  dict(n=120, lead=0.15),
+    "ETH":  dict(n=120, lead=0.10),
+    "SOL":  dict(n=120, lead=0.15),
+    "BNB":  dict(n=240, lead=0.15),
+    "DOGE": dict(n=180, lead=0.25),
+    "HYPE": dict(n=180, lead=0.30),
 }
+FAV_FLOOR = envf("STRAT_FAV_FLOOR", 0.80)   # only back a clear market favorite
+FAV_CEIL  = envf("STRAT_FAV_CEIL", 0.97)    # but not so pricey there's no profit
 
 ENABLED      = envi("STRAT_ENABLED", 0) == 1
 DRY_RUN      = envi("STRAT_DRY_RUN", 1) == 1
@@ -355,33 +361,47 @@ def tick_size(token_id):
 
 # ---- signal scan ------------------------------------------------------------
 def signals_from(windows):
+    """v2: buy the market FAVORITE only when the chainlink lead is strong (per-coin)
+    AND agrees with the favorite AND the favorite is priced in [FAV_FLOOR, FAV_CEIL]."""
     now = time.time()
     sigs = []
     for w in windows:
         a = w["asset"]
-        rule = RULES[a]
+        rule = RULES.get(a)
+        if not rule:
+            continue  # coin not in the strategy (e.g. XRP)
         t_left = int(w["close"] - now)
         if not (rule["n"] - FIRE_BAND < t_left <= rule["n"]) or t_left < MIN_TLEFT:
             continue
+        # 1) chainlink lead must be strong enough
         strike = strike_at(a, w["start"])
         pn = price_now(a)
-        if not strike or not pn:
+        if not strike or strike <= 0 or not pn:
             continue
         price, pts = pn
         if now - pts > STALE_SEC:
             continue  # stale RTDS feed — do not trust
-        if strike <= 0:
-            continue
         lead = (price - strike) / strike * 100.0
         if abs(lead) < rule["lead"]:
             continue
-        direction = "UP" if lead > 0 else "DN"
-        token = w["ty"] if direction == "UP" else w["tn"]
-        ask, _bid = token_book(token)          # real price we'd pay for that side
-        if not token or ask is None or not (0 < ask <= rule["cap"]):
+        lead_dir = "UP" if lead > 0 else "DN"
+        # 2) find the market favorite (higher-priced side) from the live books
+        up_ask, up_bid = token_book(w["ty"])
+        dn_ask, dn_bid = token_book(w["tn"])
+        if up_ask is None or dn_ask is None:
             continue
-        sigs.append(dict(asset=a, market_id=w["market_id"], direction=direction,
-                         token_id=token, cap=rule["cap"], entry_est=ask,
+        up_mid = (up_ask + up_bid) / 2 if up_bid else up_ask
+        if up_mid >= 0.5:
+            fav_dir, fav_tok, fav_ask = "UP", w["ty"], up_ask
+        else:
+            fav_dir, fav_tok, fav_ask = "DN", w["tn"], dn_ask
+        # 3) lead must agree with the favorite, and the favorite must be priced right
+        if fav_dir != lead_dir:
+            continue
+        if not (FAV_FLOOR <= fav_ask <= FAV_CEIL):
+            continue
+        sigs.append(dict(asset=a, market_id=w["market_id"], direction=fav_dir,
+                         token_id=fav_tok, cap=FAV_CEIL, entry_est=fav_ask,
                          lead=round(lead, 3), t_left=t_left, deadline=int(w["close"])))
     return sigs
 
@@ -390,7 +410,9 @@ def next_sleep(windows):
     now = time.time()
     soonest = None
     for w in windows:
-        rule = RULES[w["asset"]]
+        rule = RULES.get(w["asset"])
+        if not rule:
+            continue
         t_left = w["close"] - now
         if rule["n"] - FIRE_BAND < t_left <= rule["n"]:
             return LOOP_MIN
