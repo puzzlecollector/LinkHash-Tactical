@@ -100,6 +100,8 @@ STALE_SEC    = envi("STRAT_STALE_SEC", 20)   # chainlink price must be fresher
 SETTLE_GRACE = envi("STRAT_SETTLE_GRACE", 180)
 LOOP_MIN     = envf("STRAT_INTERVAL", 5)      # fast poll near a window close
 LOOP_MAX     = envf("STRAT_INTERVAL_IDLE", 30)
+SELL_AT      = envf("STRAT_SELL_AT", 0.99)    # after a buy, rest a limit SELL here
+                                              # (0 = off; hold to $1 redeem instead)
 DB_PATH      = os.environ.get("STRAT_DB", os.path.join(HERE, "strategy_bot.sqlite3"))
 
 # LinkHash Data API — settlement accounting only (observation).
@@ -485,6 +487,28 @@ def execute(con, sig):
          round(size * entry, 2), int(time.time()), order_id, status,
          sig["t_left"], sig["lead"], sig["deadline"], dry))
     con.commit()
+
+    # After a real fill, rest a limit SELL at SELL_AT (e.g. 0.99) so a winning
+    # position can exit early (maker, no fee, avoids a last-minute reversal). If
+    # unfilled it auto-cancels at window close and we redeem at $1. Sell an
+    # INTEGER share count so shares×0.99 has ≤2 decimals (avoids "invalid amounts").
+    if LIVE and status == "filled" and SELL_AT > 0:
+        try:
+            sell_sz = int(size)               # floor to whole shares we hold
+            if sell_sz >= 1:
+                from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions as _OPT2
+                try:
+                    from py_clob_client_v2 import Side as _S2; _sell = _S2.SELL
+                except Exception:
+                    from py_clob_client_v2.order_builder.constants import SELL as _sell
+                sresp = clob().create_and_post_order(
+                    order_args=OrderArgs(token_id=sig["token_id"], price=SELL_AT,
+                                         size=float(sell_sz), side=_sell),
+                    options=_OPT2(tick_size=tick_size(sig["token_id"])),
+                    order_type=OrderType.GTC)
+                log("  +limit SELL %d @ %.2f -> %s" % (sell_sz, SELL_AT, (sresp or {}).get("status")))
+        except Exception as e:
+            log("  sell-order err: %r" % e)
 
     if status in ("filled", "dry") and ((not dry) or TG_DRY):
         arrow = "🟢 UP" if sig["direction"] == "UP" else "🔴 DOWN"
