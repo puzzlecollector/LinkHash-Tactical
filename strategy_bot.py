@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """LinkHash strategy bot — Polymarket crypto 15m up/down edge trader.
 
-STRATEGY v2 (per-coin, tuned + fee-adjusted on all stored 15m windows):
-  In the final minutes of a 15m window, only when the Chainlink price has led its
-  window-open "strike" by a STRONG per-coin margin (LEAD%), buy the MARKET
-  FAVORITE (the higher-priced side) — provided the lead agrees with the favorite
-  and the favorite is priced in [FAV_FLOOR, FAV_CEIL]. At a strong lead the win
-  rate exceeds the price paid (win > price ⇒ +EV); weak leads / cheap "underdog"
-  sides are skipped (they were -EV live). XRP excluded (its moves mean-revert).
-  Fee-adjusted net ROI/bet: ETH +5% · HYPE +4% · SOL +3% · DOGE +3% · BNB +2% · BTC +5%.
+STRATEGY v3 — "underlying-first" (per-coin, fee-adjusted on all stored 15m windows):
+  The CHAINLINK move is the primary signal, NOT the (thin, manipulable) token price.
+  In the final minutes, when a coin has moved >= LEAD% off its window-open "strike",
+  buy THAT direction as long as it's still CHEAP (ask in [BUY_FLOOR, CEIL]) — i.e.
+  not yet priced in. Buying the strong-lead direction while cheap is where the edge
+  is (win > price ⇒ big +EV); it beats waiting for it to become an expensive
+  favorite. Weak-lead cheap sides are the trap that lost live (v1). XRP excluded
+  (mean-reverts). Fee-adj net ROI/bet at the cheap ceiling: HYPE +46% · SOL +19% ·
+  ETH +15% · DOGE +16% · BTC +7% · BNB +5% (small-n coins are lower-confidence).
 
 DATA SOURCES — Polymarket-direct (same feeds any Polymarket trader has, lowest
 latency, fair):
@@ -76,16 +77,21 @@ def envi(name, default):
 # FAV_CEIL]) only when the chainlink lead is strong enough AND points the same
 # way. High win rate at these strong leads makes the favorite +EV (win>price).
 # XRP is EXCLUDED — its short-term moves mean-revert, so leads don't persist.
+# v3 — "underlying-first": the CHAINLINK move (lead) is the primary signal, not the
+# (manipulable) token price. When the coin has moved >= lead% and that direction is
+# still cheap (ask <= ceil, i.e. not yet priced in), buy it. Per-coin:
+#   n    = seconds-left to act (final minutes)
+#   lead = min |chainlink move %| vs the window-open strike
+#   ceil = max price we'll pay for that direction (the "not-priced-in" ceiling)
 RULES = {
-    "BTC":  dict(n=120, lead=0.15),
-    "ETH":  dict(n=120, lead=0.10),
-    "SOL":  dict(n=120, lead=0.15),
-    "BNB":  dict(n=240, lead=0.15),
-    "DOGE": dict(n=180, lead=0.25),
-    "HYPE": dict(n=180, lead=0.30),
+    "BTC":  dict(n=180, lead=0.15, ceil=0.90),
+    "ETH":  dict(n=240, lead=0.10, ceil=0.80),
+    "SOL":  dict(n=240, lead=0.10, ceil=0.80),
+    "BNB":  dict(n=180, lead=0.10, ceil=0.90),
+    "DOGE": dict(n=120, lead=0.15, ceil=0.90),
+    "HYPE": dict(n=120, lead=0.10, ceil=0.80),
 }
-FAV_FLOOR = envf("STRAT_FAV_FLOOR", 0.80)   # only back a clear market favorite
-FAV_CEIL  = envf("STRAT_FAV_CEIL", 0.97)    # but not so pricey there's no profit
+BUY_FLOOR = envf("STRAT_BUY_FLOOR", 0.40)   # skip deep-underdog noise below this
 
 ENABLED      = envi("STRAT_ENABLED", 0) == 1
 DRY_RUN      = envi("STRAT_DRY_RUN", 1) == 1
@@ -407,8 +413,10 @@ def tick_size(token_id):
 
 # ---- signal scan ------------------------------------------------------------
 def signals_from(windows):
-    """v2: buy the market FAVORITE only when the chainlink lead is strong (per-coin)
-    AND agrees with the favorite AND the favorite is priced in [FAV_FLOOR, FAV_CEIL]."""
+    """v3 (underlying-first): the CHAINLINK lead is the primary signal. When a coin
+    has moved >= lead% by the per-coin fire time, buy THAT direction as long as it's
+    still cheap (ask in [BUY_FLOOR, ceil]) — i.e. not yet priced in. The token price
+    is only a ceiling (don't overpay), never the direction (it can be manipulated)."""
     now = time.time()
     sigs = []
     for w in windows:
@@ -419,7 +427,7 @@ def signals_from(windows):
         t_left = int(w["close"] - now)
         if not (rule["n"] - FIRE_BAND < t_left <= rule["n"]) or t_left < MIN_TLEFT:
             continue
-        # 1) chainlink lead must be strong enough
+        # 1) chainlink lead (underlying move) must be strong enough — the primary signal
         strike = strike_at(a, w["start"])
         pn = price_now(a)
         if not strike or strike <= 0 or not pn:
@@ -430,24 +438,14 @@ def signals_from(windows):
         lead = (price - strike) / strike * 100.0
         if abs(lead) < rule["lead"]:
             continue
-        lead_dir = "UP" if lead > 0 else "DN"
-        # 2) find the market favorite (higher-priced side) from the live books
-        up_ask, up_bid = token_book(w["ty"])
-        dn_ask, dn_bid = token_book(w["tn"])
-        if up_ask is None or dn_ask is None:
+        # 2) buy THAT direction's token if it's still cheap (not yet priced in)
+        direction = "UP" if lead > 0 else "DN"
+        token = w["ty"] if direction == "UP" else w["tn"]
+        ask, _bid = token_book(token)
+        if ask is None or not (BUY_FLOOR <= ask <= rule["ceil"]):
             continue
-        up_mid = (up_ask + up_bid) / 2 if up_bid else up_ask
-        if up_mid >= 0.5:
-            fav_dir, fav_tok, fav_ask = "UP", w["ty"], up_ask
-        else:
-            fav_dir, fav_tok, fav_ask = "DN", w["tn"], dn_ask
-        # 3) lead must agree with the favorite, and the favorite must be priced right
-        if fav_dir != lead_dir:
-            continue
-        if not (FAV_FLOOR <= fav_ask <= FAV_CEIL):
-            continue
-        sigs.append(dict(asset=a, market_id=w["market_id"], direction=fav_dir,
-                         token_id=fav_tok, cap=FAV_CEIL, entry_est=fav_ask,
+        sigs.append(dict(asset=a, market_id=w["market_id"], direction=direction,
+                         token_id=token, cap=rule["ceil"], entry_est=ask,
                          lead=round(lead, 3), t_left=t_left, deadline=int(w["close"])))
     return sigs
 
