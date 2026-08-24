@@ -323,6 +323,39 @@ def token_book(token_id):
     return (min(asks) if asks else None), (max(bids) if bids else None)
 
 
+def gamma_outcome(slug):
+    """Polymarket's ACTUAL resolution for a 15m market, via Gamma.
+    Returns 'YES' (Up won), 'NO' (Down won), or None if not yet resolved.
+    Polymarket resolves on the window TWAP vs strike — this is the source of
+    truth. Do NOT use a close-vs-open (endpoint) proxy: for razor-thin windows
+    the two disagree (e.g. a late tick up = endpoint YES but TWAP NO)."""
+    try:
+        evs = _session.get(GAMMA_URL, params={"slug": slug}, timeout=15).json()
+    except Exception as e:
+        log("gamma outcome error %s: %r" % (slug, e))
+        return None
+    if not evs:
+        return None
+    e = evs[0]
+    if not e.get("closed"):
+        return None
+    mk = (e.get("markets") or [{}])[0]
+    prices = mk.get("outcomePrices")
+    if isinstance(prices, str):
+        prices = json.loads(prices or "[]")
+    if not prices or len(prices) < 2:
+        return None
+    try:
+        up, dn = float(prices[0]), float(prices[1])
+    except (TypeError, ValueError):
+        return None
+    if up >= 0.99 and dn <= 0.01:
+        return "YES"
+    if dn >= 0.99 and up <= 0.01:
+        return "NO"
+    return None  # closed but not decisively resolved yet — retry next cycle
+
+
 # ---- LinkHash Data API (settlement accounting only) ------------------------
 def lhx_get(path, **params):
     headers = {"Authorization": f"Bearer {LHX_KEY}"} if LHX_KEY else {}
@@ -585,31 +618,22 @@ def settle(con):
     if not todo:
         return
     settled_now = []
-    by_asset = {}
-    for row in todo:
-        by_asset.setdefault(row[1], []).append(row)
-    for asset, items in by_asset.items():
-        try:
-            setts = lhx_get("/api/v1/settlements", asset=asset, venue=VENUE,
-                            cycle="15m", limit=500) or []
-        except Exception as e:
-            log("settle fetch error %s: %r" % (asset, e))
+    for mid, asset, direction, entry, size, notional, dry in todo:
+        # Source of truth = Polymarket's real (TWAP) resolution, NOT LHX's
+        # endpoint outcome — the latter mislabels razor-thin windows.
+        outcome = gamma_outcome(mid)
+        if not outcome:
             continue
-        omap = {s.get("market_id"): (s.get("outcome") or "").upper() for s in setts}
-        for mid, _a, direction, entry, size, notional, dry in items:
-            outcome = omap.get(mid)
-            if not outcome:
-                continue
-            won = (outcome == "YES" and direction == "UP") or (outcome == "NO" and direction == "DN")
-            if dry:
-                pnl = round((1.0 - entry) * size if won else -entry * size, 4)
-            else:
-                pnl = round((size - notional) if won else -notional, 4)
-            con.execute("UPDATE trades SET outcome=?, pnl=?, status=? WHERE market_id=?",
-                        (outcome, pnl, "settled_win" if won else "settled_loss", mid))
-            log("SETTLE %s %s %s pnl=%+.3f" % (asset, direction, outcome, pnl))
-            settled_now.append(dict(asset=asset, direction=direction, outcome=outcome,
-                                    pnl=pnl, won=won, dry=dry))
+        won = (outcome == "YES" and direction == "UP") or (outcome == "NO" and direction == "DN")
+        if dry:
+            pnl = round((1.0 - entry) * size if won else -entry * size, 4)
+        else:
+            pnl = round((size - notional) if won else -notional, 4)
+        con.execute("UPDATE trades SET outcome=?, pnl=?, status=? WHERE market_id=?",
+                    (outcome, pnl, "settled_win" if won else "settled_loss", mid))
+        log("SETTLE %s %s %s pnl=%+.3f" % (asset, direction, outcome, pnl))
+        settled_now.append(dict(asset=asset, direction=direction, outcome=outcome,
+                                pnl=pnl, won=won, dry=dry))
     con.commit()
 
     notify = [s for s in settled_now if (not s["dry"]) or TG_DRY]
