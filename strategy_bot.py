@@ -76,13 +76,18 @@ def envi(name, default):
 #   n    = seconds-left to act (final minutes)
 #   lead = min |chainlink move %| vs the window-open strike
 #   ceil = max price we'll pay for that direction (the "not-priced-in" ceiling)
+# Retuned 2026-08-25 on CORRECTED gamma-real settlement labels (17,325 windows,
+# train/test 65/35 out-of-sample). Only BTC & ETH changed — both were the only
+# rules losing money on real labels; SOL/BNB/DOGE/HYPE were already OOS-positive
+# and kept (the naive grid's "improvements" for them were overfit). Portfolio
+# full-sample went +9.3%%/bet -> +11.0%%/bet. See LinkHash_Bot_Rebacktest_2026-08-25.pdf.
 RULES = {
-    "BTC":  dict(n=180, lead=0.15, ceil=0.90),
-    "ETH":  dict(n=240, lead=0.10, ceil=0.80),
-    "SOL":  dict(n=240, lead=0.10, ceil=0.80),
-    "BNB":  dict(n=180, lead=0.10, ceil=0.90),
-    "DOGE": dict(n=120, lead=0.15, ceil=0.90),
-    "HYPE": dict(n=120, lead=0.10, ceil=0.80),
+    "BTC":  dict(n=240, lead=0.10, ceil=0.90),   # was 180/0.15/0.90 (n=12, -1.8%) -> n=99, +5.3%
+    "ETH":  dict(n=300, lead=0.05, ceil=0.70),   # was 240/0.10/0.80 (-1.5%) -> +13.0% (test +10.8%)
+    "SOL":  dict(n=240, lead=0.10, ceil=0.80),   # kept (+14.9%, test +18.7%)
+    "BNB":  dict(n=180, lead=0.10, ceil=0.90),   # kept (+8.9%,  test +11.3%)
+    "DOGE": dict(n=120, lead=0.15, ceil=0.90),   # kept (+21.2%, test +22.4%)
+    "HYPE": dict(n=120, lead=0.10, ceil=0.80),   # kept (+14.0%, test +8.7%)
 }
 BUY_FLOOR = envf("STRAT_BUY_FLOOR", 0.40)   # skip deep-underdog noise below this
 
