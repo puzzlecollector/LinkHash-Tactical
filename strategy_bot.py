@@ -101,6 +101,7 @@ COINS        = [c.strip().upper() for c in
 FIRE_BAND    = envi("STRAT_FIRE_BAND", 45)   # act within (n-BAND, n] seconds left
 MIN_TLEFT    = envi("STRAT_MIN_TLEFT", 15)   # need this many secs to fill
 STALE_SEC    = envi("STRAT_STALE_SEC", 20)   # chainlink price must be fresher
+TWAP_CONFIRM = envi("STRAT_TWAP_CONFIRM", 1) == 1   # require twap-60s to agree w/ spot lead
 SETTLE_GRACE = envi("STRAT_SETTLE_GRACE", 180)
 LOOP_MIN     = envf("STRAT_INTERVAL", 5)      # fast poll near a window close
 LOOP_MAX     = envf("STRAT_INTERVAL_IDLE", 30)
@@ -152,8 +153,13 @@ def tg_send(text):
 
 # ---- Chainlink RTDS price feed (background thread) --------------------------
 _plock = threading.Lock()
-PRICE = {}                                             # asset -> (price, ts)
+PRICE = {}                                             # asset -> (price, ts)  [chainlink spot]
 BUF = collections.defaultdict(lambda: collections.deque(maxlen=2400))  # asset -> [(ts,price)]
+# The Chainlink twap-60s stream — the ACTUAL settlement basis (Up iff twap@close >=
+# twap@open). Used ONLY as a confirmation gate: we bet the spot-lead direction only
+# when the twap-60s lead agrees. Same RTDS relay, creds-free.
+TWAP = {}                                              # asset -> (twap60, ts)
+TWAPBUF = collections.defaultdict(lambda: collections.deque(maxlen=2400))  # asset -> [(ts,twap60)]
 
 
 def _on_rtds(raw):
@@ -163,7 +169,10 @@ def _on_rtds(raw):
         return
     now = time.time()
     for m in (data if isinstance(data, list) else [data]):
-        if not isinstance(m, dict) or m.get("topic") != "crypto_prices_chainlink":
+        if not isinstance(m, dict):
+            continue
+        topic = m.get("topic")
+        if topic not in ("crypto_prices_chainlink", "crypto_prices_twap_sixty"):
             continue
         p = m.get("payload") or {}
         sym = str(p.get("symbol") or "").lower()
@@ -182,14 +191,19 @@ def _on_rtds(raw):
         mts = p.get("timestamp")
         ts = float(mts) / 1000.0 if mts else now
         with _plock:
-            PRICE[asset] = (val, ts)
-            BUF[asset].append((ts, val))
+            if topic == "crypto_prices_chainlink":
+                PRICE[asset] = (val, ts)
+                BUF[asset].append((ts, val))
+            else:  # crypto_prices_twap_sixty
+                TWAP[asset] = (val, ts)
+                TWAPBUF[asset].append((ts, val))
 
 
 def _rtds_thread():
     import websocket  # websocket-client
     sub = json.dumps({"action": "subscribe", "subscriptions": [
-        {"topic": "crypto_prices_chainlink", "type": "*", "filters": ""}]})
+        {"topic": "crypto_prices_chainlink", "type": "*", "filters": ""},
+        {"topic": "crypto_prices_twap_sixty", "type": "*", "filters": ""}]})
     while True:
         try:
             ws = websocket.create_connection(RTDS_URL, timeout=20, max_size=4_000_000)
@@ -271,9 +285,28 @@ def price_now(asset):
         return PRICE.get(asset)
 
 
+def twap_strike_at(asset, epoch):
+    """Buffered twap-60s at/just-before the window-open epoch (the twap 'strike').
+    None until the buffer covers that time — caller falls back to spot-only then."""
+    with _plock:
+        best = None
+        for ts, v in TWAPBUF[asset]:
+            if ts <= epoch:
+                best = v
+            else:
+                break
+        return best
+
+
+def twap_now(asset):
+    with _plock:
+        return TWAP.get(asset)
+
+
 def rtds_coverage():
     with _plock:
-        return {a: (len(BUF[a]), PRICE.get(a, (None, None))[1]) for a in RULES}
+        return {a: dict(spot=len(BUF[a]), twap=len(TWAPBUF[a]),
+                        last=PRICE.get(a, (None, None))[1]) for a in RULES}
 
 
 # ---- Polymarket market discovery (Gamma) + order book (public CLOB) ---------
@@ -471,6 +504,18 @@ def signals_from(windows):
             continue
         # 2) buy THAT direction's token if it's still cheap (not yet priced in)
         direction = "UP" if lead > 0 else "DN"
+        # 2b) TWAP confirmation gate — the market settles on the twap-60s stream, so
+        # only take the spot-lead bet when the twap-60s lead AGREES with it. Spot vs
+        # twap disagreement flags the risky windows (spot moved but the settle basis
+        # hasn't) — those lose. Missing twap (warmup/feed gap) falls back to spot-only.
+        if TWAP_CONFIRM:
+            tstrike = twap_strike_at(a, w["start"])
+            tn = twap_now(a)
+            if tstrike and tstrike > 0 and tn and (now - tn[1]) <= STALE_SEC:
+                tlead = (tn[0] - tstrike) / tstrike * 100.0
+                tdir = "UP" if tlead > 0 else "DN"
+                if tdir != direction:
+                    continue  # spot & twap disagree — skip
         token = w["ty"] if direction == "UP" else w["tn"]
         ask, _bid = token_book(token)
         if ask is None or not (BUY_FLOOR <= ask <= rule["ceil"]):
