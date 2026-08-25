@@ -94,8 +94,24 @@ BUY_FLOOR = envf("STRAT_BUY_FLOOR", 0.40)   # skip deep-underdog noise below thi
 ENABLED      = envi("STRAT_ENABLED", 0) == 1
 DRY_RUN      = envi("STRAT_DRY_RUN", 1) == 1
 BET_USDC     = envf("STRAT_BET_USDC", 5)
+# Confidence-scaled stake: weak-lead (marginal) bets get BET_MIN, strong-lead
+# (high-confidence) ones ramp up to BET_MAX. Backtest: sizes the risky marginal
+# bets down without hurting ROI (~+10%). BET_SIZING=0 -> flat BET_USDC.
+BET_SIZING   = envi("STRAT_BET_SIZING", 1) == 1
+BET_MIN      = envf("STRAT_BET_MIN", 2)
+BET_MAX      = envf("STRAT_BET_MAX", 6)
+SIZE_LEAD_FULL = envf("STRAT_SIZE_LEAD_FULL", 0.25)  # |lead|% at which the stake hits BET_MAX
 MAX_EXPOSURE = envf("STRAT_MAX_EXPOSURE", 50)
 MAX_LOSS     = envf("STRAT_MAX_LOSS", 30)
+
+
+def bet_size(lead):
+    """Stake in [BET_MIN, BET_MAX] scaled by |lead| strength (confidence). f ramps
+    0 at 0.05% lead -> 1 at SIZE_LEAD_FULL%. Flat BET_USDC when BET_SIZING is off."""
+    if not BET_SIZING:
+        return round(max(BET_USDC, 1.0), 2)
+    f = (abs(lead) - 0.05) / max(1e-6, SIZE_LEAD_FULL - 0.05)
+    return round(BET_MIN + (BET_MAX - BET_MIN) * max(0.0, min(1.0, f)), 2)
 COINS        = [c.strip().upper() for c in
                 os.environ.get("STRAT_COINS", ",".join(RULES)).split(",") if c.strip()]
 FIRE_BAND    = envi("STRAT_FIRE_BAND", 45)   # act within (n-BAND, n] seconds left
@@ -557,7 +573,8 @@ def execute(con, sig):
         return
 
     entry = sig["entry_est"]
-    size = round(BET_USDC / max(entry, 0.01), 2)
+    amt = bet_size(sig["lead"])                  # confidence-scaled stake ($2..$6)
+    size = round(amt / max(entry, 0.01), 2)
     order_id = None
     dry = 0 if LIVE else 1
     status = "dry"
@@ -569,7 +586,7 @@ def execute(con, sig):
                 log("skip %s: live ask %s > cap %.2f" % (sig["asset"], ask, sig["cap"]))
                 return
             entry = ask
-            amount = round(max(BET_USDC, 1.0), 2)              # USDC to spend (>= $1 min)
+            amount = round(max(amt, 1.0), 2)                   # confidence-scaled USDC to spend
             size = round(amount / max(entry, 0.01), 2)         # shares, for the record
             from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions as _OPT
             try:
