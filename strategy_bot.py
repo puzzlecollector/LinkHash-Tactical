@@ -81,13 +81,21 @@ def envi(name, default):
 # rules losing money on real labels; SOL/BNB/DOGE/HYPE were already OOS-positive
 # and kept (the naive grid's "improvements" for them were overfit). Portfolio
 # full-sample went +9.3%%/bet -> +11.0%%/bet. See LinkHash_Bot_Rebacktest_2026-08-25.pdf.
+# v4 (2026-08-26): UNIFORM rule across all 7 coins — fire 3min (180s) before close,
+# buy the chainlink-lead direction only when the coin has moved >= 0.20% from strike,
+# up to ceil 0.985. Rationale: honest train->test sweep over entry time x threshold
+# found 180s the ROI sweet-spot (test +1.4%; 5min/4min worse, 2min priced-in), a flat
+# 0.20% threshold beats per-coin tuning (per-coin overfits: tiny per-coin samples,
+# train<->test sign flips), and dropping BNB/HYPE was NOT justified (train went -1.2%).
+# Direction = spot sign; token price is only a ceiling. All 7 coins uniform on purpose.
 RULES = {
-    "BTC":  dict(n=240, lead=0.10, ceil=0.90),   # was 180/0.15/0.90 (n=12, -1.8%) -> n=99, +5.3%
-    "ETH":  dict(n=300, lead=0.05, ceil=0.70),   # was 240/0.10/0.80 (-1.5%) -> +13.0% (test +10.8%)
-    "SOL":  dict(n=240, lead=0.10, ceil=0.80),   # kept (+14.9%, test +18.7%)
-    "BNB":  dict(n=180, lead=0.10, ceil=0.90),   # kept (+8.9%,  test +11.3%)
-    "DOGE": dict(n=120, lead=0.15, ceil=0.90),   # kept (+21.2%, test +22.4%)
-    "HYPE": dict(n=120, lead=0.10, ceil=0.80),   # kept (+14.0%, test +8.7%)
+    "BTC":  dict(n=180, lead=0.20, ceil=0.985),
+    "ETH":  dict(n=180, lead=0.20, ceil=0.985),
+    "SOL":  dict(n=180, lead=0.20, ceil=0.985),
+    "XRP":  dict(n=180, lead=0.20, ceil=0.985),
+    "BNB":  dict(n=180, lead=0.20, ceil=0.985),
+    "DOGE": dict(n=180, lead=0.20, ceil=0.985),
+    "HYPE": dict(n=180, lead=0.20, ceil=0.985),
 }
 BUY_FLOOR = envf("STRAT_BUY_FLOOR", 0.40)   # skip deep-underdog noise below this
 
