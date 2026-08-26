@@ -1,0 +1,20 @@
+{
+  "features": [
+    "clm30",
+    "clm60",
+    "clm120",
+    "tok_mid60",
+    "tok_spread60",
+    "ret15",
+    "ret30",
+    "ret60"
+  ],
+  "label": "burst_up (UP if up_mfe>=dn_mfe)",
+  "entry_sec": 120,
+  "TP": 0.3,
+  "SL": 0.15,
+  "val_auc": 0.6192,
+  "n_train": 2959,
+  "asset": "BTC",
+  "note": "predict prob token spikes UP; buy that side at open+120s, TP+30%/SL-15%"
+}
