@@ -88,14 +88,18 @@ def envi(name, default):
 # 0.20% threshold beats per-coin tuning (per-coin overfits: tiny per-coin samples,
 # train<->test sign flips), and dropping BNB/HYPE was NOT justified (train went -1.2%).
 # Direction = spot sign; token price is only a ceiling. All 7 coins uniform on purpose.
+# v4.1 (2026-08-26): lead 0.20 -> 0.22. Fine-bucket backtest (test+full) showed the
+# razor-edge 0.20-0.22% slice is ROI-negative (92% win but ~0.92 ask = below breakeven);
+# 0.22% cutoff drops it -> test ROI +1.3%->+1.6%, full +1.1%->+1.4%. Also better for the
+# competition cum% metric (each loss = -100%, so cutting negative-margin bets matters more).
 RULES = {
-    "BTC":  dict(n=180, lead=0.20, ceil=0.985),
-    "ETH":  dict(n=180, lead=0.20, ceil=0.985),
-    "SOL":  dict(n=180, lead=0.20, ceil=0.985),
-    "XRP":  dict(n=180, lead=0.20, ceil=0.985),
-    "BNB":  dict(n=180, lead=0.20, ceil=0.985),
-    "DOGE": dict(n=180, lead=0.20, ceil=0.985),
-    "HYPE": dict(n=180, lead=0.20, ceil=0.985),
+    "BTC":  dict(n=180, lead=0.22, ceil=0.985),
+    "ETH":  dict(n=180, lead=0.22, ceil=0.985),
+    "SOL":  dict(n=180, lead=0.22, ceil=0.985),
+    "XRP":  dict(n=180, lead=0.22, ceil=0.985),
+    "BNB":  dict(n=180, lead=0.22, ceil=0.985),
+    "DOGE": dict(n=180, lead=0.22, ceil=0.985),
+    "HYPE": dict(n=180, lead=0.22, ceil=0.985),
 }
 BUY_FLOOR = envf("STRAT_BUY_FLOOR", 0.40)   # skip deep-underdog noise below this
 
