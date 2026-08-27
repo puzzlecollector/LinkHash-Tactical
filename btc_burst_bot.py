@@ -34,7 +34,8 @@ MAX_SPREAD= float(os.environ.get("STRAT_BURST_MAX_SPREAD", "0.04")) # skip if as
 FEATURES  = ["clm30", "clm60", "clm120", "ret15", "ret30", "ret60"]
 MODEL     = os.path.join(os.path.dirname(__file__), "models", "btc_burst6.json")
 DB_PATH   = os.environ.get("STRAT_BURST_DB", os.path.join(os.path.dirname(__file__), "burst_bot.sqlite3"))
-POLL      = 4
+POLL_IDLE = float(os.environ.get("STRAT_BURST_POLL_IDLE", "4"))   # flat: entry detection (Gamma)
+POLL_HOLD = float(os.environ.get("STRAT_BURST_POLL_HOLD", "1"))   # holding: tight TP/SL monitor (orderbook only)
 STALE_TOL = 12   # a chainlink sample must be within this many secs of the target epoch
 
 _booster = None
@@ -208,16 +209,16 @@ def main():
     con = db()
     while True:
         try:
-            wins = [w for w in sb.open_windows() if w["asset"] == ASSET]
-            now = time.time()
-            for w in wins:
-                t_into = now - w["start"]
-                if BAND[0] <= t_into <= BAND[1]:
-                    try_enter(con, w)
-            manage(con)
+            holding = has_open(con)
+            if not holding:                      # only look for entries when flat (Gamma call)
+                now = time.time()
+                for w in [w for w in sb.open_windows() if w["asset"] == ASSET]:
+                    if BAND[0] <= (now - w["start"]) <= BAND[1]:
+                        try_enter(con, w)
+            manage(con)                          # monitor/exit open positions (orderbook)
         except Exception as e:
             sb.log("burst loop err: %r" % e)
-        time.sleep(POLL)
+        time.sleep(POLL_HOLD if has_open(con) else POLL_IDLE)
 
 if __name__ == "__main__":
     main()
