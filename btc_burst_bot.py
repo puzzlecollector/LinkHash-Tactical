@@ -166,6 +166,25 @@ def try_enter(con, w):
                    f"{ASSET} {arrow}  ${STAKE:.0f} @ {entry*100:.1f}¢  (prob_up {p:.2f})\n"
                    f"TP {tp_lvl*100:.1f}¢ / SL {sl_lvl*100:.1f}¢ · entry@{ENTRY_SEC}s")
 
+def resolve_settled(con, mid, direction, entry, shares, now, dry):
+    """A position rode to settlement (shares auto-redeemed, book gone). Resolve via the
+    Polymarket gamma outcome and close the row. Returns True if resolved+recorded, False
+    if gamma isn't decisive yet (caller retries). Prevents a redeemed position from being
+    stuck open forever on failed sells (which would block all new entries)."""
+    oc = sb.gamma_outcome(mid)                       # 'YES'=Up won, 'NO'=Down won, None=not resolved
+    if oc is None:
+        return False
+    won = (oc == "YES" and direction == "UP") or (oc == "NO" and direction == "DN")
+    ret = (1 - entry) / entry if won else -1.0       # shares settle to 1 (win) or 0 (loss)
+    pnl = round(ret * shares * entry, 4)
+    con.execute("UPDATE burst_trades SET exit_ts=?,exit_reason=?,exit_price=?,exit_order=?,ret=?,pnl=?,settled=1 WHERE market_id=?",
+                (now, "settle", 1.0 if won else 0.0, "redeem", round(ret, 4), pnl, mid))
+    con.commit()
+    sb.log("BURST SETTLE %s %s %s ret %+.1f%% ($%+.2f)" % (mid[:24], direction, "WON" if won else "LOST", 100*ret, pnl))
+    if (not dry) or sb.TG_DRY:
+        sb.tg_send(f"{'✅' if won else '❌'} <b>BURST SETTLE</b> {ASSET} {direction} {'WON' if won else 'LOST'} · ret {100*ret:+.1f}% (${pnl:+.2f})")
+    return True
+
 # ---------- monitor / exit ----------
 def manage(con):
     now = int(time.time())
@@ -182,22 +201,18 @@ def manage(con):
             elif now >= close + SETTLE_WAIT:
                 if _settle_next.get(mid, 0) > now: continue      # throttle gamma polling to ~15s
                 _settle_next[mid] = now + 15
-                oc = sb.gamma_outcome(mid)                        # 'YES'=Up won, 'NO'=Down won, None=not resolved
-                if oc is None: continue                           # retry next cycle
-                won = (oc == "YES" and direction == "UP") or (oc == "NO" and direction == "DN")
-                ret = (1 - entry) / entry if won else -1.0        # shares settle to 1 (win) or 0 (loss)
-                pnl = round(ret * shares * entry, 4)
-                con.execute("UPDATE burst_trades SET exit_ts=?,exit_reason=?,exit_price=?,exit_order=?,ret=?,pnl=?,settled=1 WHERE market_id=?",
-                            (now, "settle", 1.0 if won else 0.0, "redeem", round(ret, 4), pnl, mid))
-                con.commit()
-                sb.log("BURST SETTLE %s %s %s ret %+.1f%% ($%+.2f)" % (mid[:24], direction, "WON" if won else "LOST", 100*ret, pnl))
-                if (not dry) or sb.TG_DRY:
-                    sb.tg_send(f"{'✅' if won else '❌'} <b>BURST SETTLE</b> {ASSET} {direction} {'WON' if won else 'LOST'} · ret {100*ret:+.1f}% (${pnl:+.2f})")
+                resolve_settled(con, mid, direction, entry, shares, now, dry)   # closes if gamma decisive, else retries
                 continue
             else:
                 continue                                          # still holding — do nothing
         else:
-            if bid is None: continue
+            if bid is None:
+                # book gone (market may have settled & de-listed) — if past close, resolve via gamma
+                # so a redeemed position never sticks open forever and blocks new entries.
+                if now >= close and _settle_next.get(mid, 0) <= now:
+                    _settle_next[mid] = now + 15
+                    resolve_settled(con, mid, direction, entry, shares, now, dry)
+                continue
             if bid >= tp: reason, px = "TP", bid                              # TP always active
             elif bid <= sl and (now - entry_ts) >= SL_GRACE: reason, px = "SL", bid  # SL only after grace (avoid early whipsaw)
             elif now >= close - 8: reason, px = "timeout", bid   # window ending → exit at market
@@ -221,12 +236,23 @@ def manage(con):
                 sb.tg_send(f"{'✅' if ret>0 else '❌'} <b>BURST {reason}</b> {ASSET} {direction} @{px*100:.1f}¢ ret {100*ret:+.1f}% (${ret*shares*entry:+.2f})")
             else:
                 msg = str(resp).lower()
-                if "balance" in msg or "not enough" in msg:
-                    sb.log("burst sell wait (shares settling) %s" % mid[:20])   # retry next cycle
+                settled_err = any(s in msg for s in ("balance", "not enough", "does not exist", "orderbook"))
+                if settled_err and now >= close:                 # shares auto-redeemed at settlement
+                    if _settle_next.get(mid, 0) <= now:
+                        _settle_next[mid] = now + 15
+                        resolve_settled(con, mid, direction, entry, shares, now, dry)
+                elif "balance" in msg or "not enough" in msg:
+                    sb.log("burst sell wait (shares settling) %s" % mid[:20])   # pre-close: retry next cycle
                 else:
                     sb.log("burst sell rejected %s: %s" % (mid[:20], resp))
         except Exception as e:
-            if "balance" in str(e).lower(): sb.log("burst sell wait %s" % mid[:20])
+            es = str(e).lower()
+            settled_err = any(s in es for s in ("balance", "not enough", "does not exist", "orderbook"))
+            if settled_err and now >= close:
+                if _settle_next.get(mid, 0) <= now:
+                    _settle_next[mid] = now + 15
+                    resolve_settled(con, mid, direction, entry, shares, now, dry)
+            elif "balance" in es: sb.log("burst sell wait %s" % mid[:20])
             else: sb.log("burst sell err %s: %r" % (mid[:20], e))
 
 def main():
