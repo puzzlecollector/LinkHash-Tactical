@@ -32,6 +32,8 @@ CONF_MIN  = float(os.environ.get("STRAT_BURST_CONF", "0.55"))   # skip near-rand
 SL_GRACE  = float(os.environ.get("STRAT_BURST_SL_GRACE", "240"))  # secs after entry before SL activates (avoid early whipsaw). TP always active.
 MAX_ENTRY = float(os.environ.get("STRAT_BURST_MAX_ENTRY", "0.70"))  # skip if ask>this: TP+30% unreachable near 1.0 + expensive-favorite low-ROI
 MAX_SPREAD= float(os.environ.get("STRAT_BURST_MAX_SPREAD", "0.04")) # skip if ask-bid wider than this (bad liquidity/whipsaw)
+HOLD      = os.environ.get("STRAT_BURST_HOLD", "0") == "1"  # hold-to-settlement mode: TP only, NO SL, ride non-TP positions to settlement (auto-redeem)
+SETTLE_WAIT = int(os.environ.get("STRAT_BURST_SETTLE_WAIT", "60"))  # secs after window close before polling gamma for the resolution
 FEATURES  = ["clm30", "clm60", "clm120", "ret15", "ret30", "ret60"]
 MODEL     = os.path.join(os.path.dirname(__file__), "models", "btc_burst6.json")
 DB_PATH   = os.environ.get("STRAT_BURST_DB", os.path.join(os.path.dirname(__file__), "burst_bot.sqlite3"))
@@ -40,6 +42,7 @@ POLL_HOLD = float(os.environ.get("STRAT_BURST_POLL_HOLD", "1"))   # holding: tig
 STALE_TOL = 12   # a chainlink sample must be within this many secs of the target epoch
 
 _booster = None
+_settle_next = {}   # hold-mode: per-market throttle for gamma resolution polling
 def model():
     global _booster
     if _booster is None:
@@ -170,11 +173,34 @@ def manage(con):
         FROM burst_trades WHERE exit_ts IS NULL AND buy_status IN ('filled','dry')""").fetchall()
     for mid, token, direction, entry, shares, tp, sl, close, dry, entry_ts in rows:
         ask, bid = sb.token_book(token)
-        if bid is None: continue
         reason = None; px = None
-        if bid >= tp: reason, px = "TP", bid                              # TP always active
-        elif bid <= sl and (now - entry_ts) >= SL_GRACE: reason, px = "SL", bid  # SL only after grace (avoid early whipsaw)
-        elif now >= close - 8: reason, px = "timeout", bid   # window ending → exit at market
+        if HOLD:
+            # HOLD-to-settlement: take the TP+X spike if it comes; otherwise ride to settlement
+            # (no SL, no timeout market-sell) and resolve via gamma — shares auto-redeem.
+            if bid is not None and bid >= tp:
+                reason, px = "TP", bid
+            elif now >= close + SETTLE_WAIT:
+                if _settle_next.get(mid, 0) > now: continue      # throttle gamma polling to ~15s
+                _settle_next[mid] = now + 15
+                oc = sb.gamma_outcome(mid)                        # 'YES'=Up won, 'NO'=Down won, None=not resolved
+                if oc is None: continue                           # retry next cycle
+                won = (oc == "YES" and direction == "UP") or (oc == "NO" and direction == "DN")
+                ret = (1 - entry) / entry if won else -1.0        # shares settle to 1 (win) or 0 (loss)
+                pnl = round(ret * shares * entry, 4)
+                con.execute("UPDATE burst_trades SET exit_ts=?,exit_reason=?,exit_price=?,exit_order=?,ret=?,pnl=?,settled=1 WHERE market_id=?",
+                            (now, "settle", 1.0 if won else 0.0, "redeem", round(ret, 4), pnl, mid))
+                con.commit()
+                sb.log("BURST SETTLE %s %s %s ret %+.1f%% ($%+.2f)" % (mid[:24], direction, "WON" if won else "LOST", 100*ret, pnl))
+                if (not dry) or sb.TG_DRY:
+                    sb.tg_send(f"{'✅' if won else '❌'} <b>BURST SETTLE</b> {ASSET} {direction} {'WON' if won else 'LOST'} · ret {100*ret:+.1f}% (${pnl:+.2f})")
+                continue
+            else:
+                continue                                          # still holding — do nothing
+        else:
+            if bid is None: continue
+            if bid >= tp: reason, px = "TP", bid                              # TP always active
+            elif bid <= sl and (now - entry_ts) >= SL_GRACE: reason, px = "SL", bid  # SL only after grace (avoid early whipsaw)
+            elif now >= close - 8: reason, px = "timeout", bid   # window ending → exit at market
         if reason is None: continue
         if dry:
             ret = (px - entry) / entry
@@ -205,8 +231,9 @@ def manage(con):
 
 def main():
     sb.start_rtds(); time.sleep(1); sb.backfill_prices(minutes=110)
-    sb.log("BURST bot start | mode=%s asset=%s stake=$%.0f TP+%.0f/SL-%.0f SLgrace=%ds entry@%ds conf>=%.2f max_entry=%.2f kill-$%.0f"
-           % ("LIVE" if sb.LIVE else "DRY", ASSET, STAKE, TP*100, SL*100, SL_GRACE, ENTRY_SEC, CONF_MIN, MAX_ENTRY, KILL))
+    exitdesc = ("HOLD-to-settle TP+%.0f/no-SL" % (TP*100)) if HOLD else ("TP+%.0f/SL-%.0f SLgrace=%ds" % (TP*100, SL*100, SL_GRACE))
+    sb.log("BURST bot start | mode=%s%s asset=%s stake=$%.0f %s entry@%ds conf>=%.2f max_entry=%.2f kill-$%.0f"
+           % ("LIVE" if sb.LIVE else "DRY", " HOLD" if HOLD else "", ASSET, STAKE, exitdesc, ENTRY_SEC, CONF_MIN, MAX_ENTRY, KILL))
     con = db()
     while True:
         try:
