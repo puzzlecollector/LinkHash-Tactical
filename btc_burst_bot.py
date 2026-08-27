@@ -29,6 +29,7 @@ ENTRY_SEC = int(os.environ.get("STRAT_BURST_ENTRY", "120"))
 BAND      = (ENTRY_SEC - 5, ENTRY_SEC + 45)     # act within this many secs into the window
 KILL      = float(os.environ.get("STRAT_BURST_KILL", "30"))
 CONF_MIN  = float(os.environ.get("STRAT_BURST_CONF", "0.55"))   # skip near-random bets (conf<this)
+SL_GRACE  = float(os.environ.get("STRAT_BURST_SL_GRACE", "240"))  # secs after entry before SL activates (avoid early whipsaw). TP always active.
 MAX_ENTRY = float(os.environ.get("STRAT_BURST_MAX_ENTRY", "0.70"))  # skip if ask>this: TP+30% unreachable near 1.0 + expensive-favorite low-ROI
 MAX_SPREAD= float(os.environ.get("STRAT_BURST_MAX_SPREAD", "0.04")) # skip if ask-bid wider than this (bad liquidity/whipsaw)
 FEATURES  = ["clm30", "clm60", "clm120", "ret15", "ret30", "ret60"]
@@ -165,14 +166,14 @@ def try_enter(con, w):
 # ---------- monitor / exit ----------
 def manage(con):
     now = int(time.time())
-    rows = con.execute("""SELECT market_id,token_id,direction,entry_ask,shares,tp_level,sl_level,close,dry
+    rows = con.execute("""SELECT market_id,token_id,direction,entry_ask,shares,tp_level,sl_level,close,dry,entry_ts
         FROM burst_trades WHERE exit_ts IS NULL AND buy_status IN ('filled','dry')""").fetchall()
-    for mid, token, direction, entry, shares, tp, sl, close, dry in rows:
+    for mid, token, direction, entry, shares, tp, sl, close, dry, entry_ts in rows:
         ask, bid = sb.token_book(token)
         if bid is None: continue
         reason = None; px = None
-        if bid >= tp: reason, px = "TP", bid
-        elif bid <= sl: reason, px = "SL", bid
+        if bid >= tp: reason, px = "TP", bid                              # TP always active
+        elif bid <= sl and (now - entry_ts) >= SL_GRACE: reason, px = "SL", bid  # SL only after grace (avoid early whipsaw)
         elif now >= close - 8: reason, px = "timeout", bid   # window ending → exit at market
         if reason is None: continue
         if dry:
@@ -204,8 +205,8 @@ def manage(con):
 
 def main():
     sb.start_rtds(); time.sleep(1); sb.backfill_prices(minutes=110)
-    sb.log("BURST bot start | mode=%s asset=%s stake=$%.0f TP+%.0f/SL-%.0f entry@%ds conf>=%.2f max_entry=%.2f kill-$%.0f"
-           % ("LIVE" if sb.LIVE else "DRY", ASSET, STAKE, TP*100, SL*100, ENTRY_SEC, CONF_MIN, MAX_ENTRY, KILL))
+    sb.log("BURST bot start | mode=%s asset=%s stake=$%.0f TP+%.0f/SL-%.0f SLgrace=%ds entry@%ds conf>=%.2f max_entry=%.2f kill-$%.0f"
+           % ("LIVE" if sb.LIVE else "DRY", ASSET, STAKE, TP*100, SL*100, SL_GRACE, ENTRY_SEC, CONF_MIN, MAX_ENTRY, KILL))
     con = db()
     while True:
         try:
