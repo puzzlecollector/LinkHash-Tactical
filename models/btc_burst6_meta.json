@@ -1,0 +1,17 @@
+{
+  "features": [
+    "clm30",
+    "clm60",
+    "clm120",
+    "ret15",
+    "ret30",
+    "ret60"
+  ],
+  "label": "burst_up",
+  "entry_sec": 120,
+  "TP": 0.3,
+  "SL": 0.15,
+  "val_auc": 0.6249,
+  "n": 2959,
+  "asset": "BTC"
+}
