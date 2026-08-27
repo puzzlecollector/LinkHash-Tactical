@@ -28,6 +28,9 @@ SL        = float(os.environ.get("STRAT_BURST_SL", "0.15"))
 ENTRY_SEC = int(os.environ.get("STRAT_BURST_ENTRY", "120"))
 BAND      = (ENTRY_SEC - 5, ENTRY_SEC + 45)     # act within this many secs into the window
 KILL      = float(os.environ.get("STRAT_BURST_KILL", "30"))
+CONF_MIN  = float(os.environ.get("STRAT_BURST_CONF", "0.55"))   # skip near-random bets (conf<this)
+MAX_ENTRY = float(os.environ.get("STRAT_BURST_MAX_ENTRY", "0.70"))  # skip if ask>this: TP+30% unreachable near 1.0 + expensive-favorite low-ROI
+MAX_SPREAD= float(os.environ.get("STRAT_BURST_MAX_SPREAD", "0.04")) # skip if ask-bid wider than this (bad liquidity/whipsaw)
 FEATURES  = ["clm30", "clm60", "clm120", "ret15", "ret30", "ret60"]
 MODEL     = os.path.join(os.path.dirname(__file__), "models", "btc_burst6.json")
 DB_PATH   = os.environ.get("STRAT_BURST_DB", os.path.join(os.path.dirname(__file__), "burst_bot.sqlite3"))
@@ -119,10 +122,17 @@ def try_enter(con, w):
         sb.log("burst skip %s: features/feed not ready" % mid[:28]); return
     vec, strike = fr
     p = predict(vec); direction = "UP" if p >= 0.5 else "DN"
+    conf = max(p, 1 - p)
+    if conf < CONF_MIN:                                    # skip near-random bets
+        sb.log("burst skip %s: conf %.3f < %.2f" % (mid[:26], conf, CONF_MIN)); return
     token = w["ty"] if direction == "UP" else w["tn"]
     ask, bid = sb.token_book(token)
     if ask is None or not (0 < ask < 0.985):
-        sb.log("burst skip %s: bad ask %s" % (mid[:28], ask)); return
+        sb.log("burst skip %s: bad ask %s" % (mid[:26], ask)); return
+    if ask > MAX_ENTRY:                                    # too expensive: TP unreachable + low-ROI favorite
+        sb.log("burst skip %s: ask %.3f > max_entry %.2f" % (mid[:26], ask, MAX_ENTRY)); return
+    if bid is not None and (ask - bid) > MAX_SPREAD:       # bad liquidity → whipsaw/slippage risk
+        sb.log("burst skip %s: spread %.3f > %.2f" % (mid[:26], ask - bid, MAX_SPREAD)); return
     entry = ask; shares = round(STAKE / entry, 2)
     tp_lvl = round(entry * (1 + TP), 4); sl_lvl = round(entry * (1 - SL), 4)
     dry = 0 if sb.LIVE else 1
@@ -193,8 +203,8 @@ def manage(con):
 
 def main():
     sb.start_rtds(); time.sleep(1); sb.backfill_prices(minutes=110)
-    sb.log("BURST bot start | mode=%s asset=%s stake=$%.0f TP+%.0f/SL-%.0f entry@%ds kill-$%.0f"
-           % ("LIVE" if sb.LIVE else "DRY", ASSET, STAKE, TP*100, SL*100, ENTRY_SEC, KILL))
+    sb.log("BURST bot start | mode=%s asset=%s stake=$%.0f TP+%.0f/SL-%.0f entry@%ds conf>=%.2f max_entry=%.2f kill-$%.0f"
+           % ("LIVE" if sb.LIVE else "DRY", ASSET, STAKE, TP*100, SL*100, ENTRY_SEC, CONF_MIN, MAX_ENTRY, KILL))
     con = db()
     while True:
         try:
