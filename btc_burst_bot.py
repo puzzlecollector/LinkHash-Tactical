@@ -105,14 +105,31 @@ def market_buy(token, cap):
     return resp or {}
 
 def marketable_sell(token, shares, limit_price):
-    """Sell `shares` at a marketable limit (fills at/above the bid). FAK."""
+    """Sell `shares` at a marketable limit (fills at/above the bid). FAK.
+
+    The recorded `shares` is theoretical (STAKE/entry); fees leave slightly FEWER
+    real shares, so selling int(shares) can exceed holdings and fail with
+    'not enough balance' — which strands the position open until it settles at
+    -100% (the stop never executes). Fix: on a balance shortfall, retry a couple
+    times with one fewer share so the actual (slightly smaller) holding is sold;
+    any residual dust redeems at settlement. Non-balance failures return as-is;
+    if shares are still settling (0 available) all sizes fail and the caller retries
+    next cycle."""
     from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions as OPT
     try: from py_clob_client_v2 import Side; sell = Side.SELL
     except Exception: from py_clob_client_v2.order_builder.constants import SELL as sell
-    resp = sb.clob().create_and_post_order(
-        order_args=OrderArgs(token_id=token, price=float(limit_price), size=float(int(shares)), side=sell),
-        options=OPT(tick_size=sb.tick_size(token)), order_type=OrderType.FAK)
-    return resp or {}
+    last = {}
+    for sz in range(int(shares), max(0, int(shares) - 3), -1):
+        if sz < 1: break
+        last = sb.clob().create_and_post_order(
+            order_args=OrderArgs(token_id=token, price=float(limit_price), size=float(sz), side=sell),
+            options=OPT(tick_size=sb.tick_size(token)), order_type=OrderType.FAK) or {}
+        if last.get("success"):
+            return last
+        m = str(last).lower()
+        if not ("not enough" in m or "balance" in m):
+            return last                      # a different failure — don't burn retries
+    return last
 
 # ---------- entry ----------
 def try_enter(con, w):
