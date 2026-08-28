@@ -77,7 +77,9 @@ def predict_up():
     ta=load_models(); feats=ta["feats"]
     df=binance_bars(400)
     F=build_feats(df)
-    row=F[feats].iloc[[-1]].replace([np.inf,-np.inf],np.nan)
+    # iloc[-1] is the CURRENTLY-FORMING (incomplete) Binance bar -> corrupts features & biases UP.
+    # Use iloc[-2] = the last COMPLETED bar, matching the training label alignment.
+    row=F[feats].iloc[[-2]].replace([np.inf,-np.inf],np.nan)
     if row.isna().any(axis=1).iloc[0]: return None
     x=(row.values[0]-np.array(ta["mean"]))/np.array(ta["scale"])
     z=float(np.dot(x,np.array(ta["coef"]))+ta["intercept"])
